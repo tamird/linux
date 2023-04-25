@@ -6,6 +6,7 @@
 
 use crate::{
     bindings,
+    block::bio::{Bio, BioIterator},
     block::mq::Operations,
     error::{Error, Result},
     hrtimer::{HasTimer, Timer, TimerCallback, TimerHandle, TimerPointer},
@@ -189,10 +190,29 @@ impl<T: Operations> Request<T> {
         if !unsafe { bindings::blk_mq_complete_request_remote(ptr) } {
             // SAFETY: We released a refcount above that we can reclaim here.
             let this = unsafe { Request::aref_from_raw(ptr) };
-             T::complete(this);
+            T::complete(this);
         }
     }
 
+    /// Get a wrapper for the first Bio in this request
+    #[inline(always)]
+    pub fn bio(&self) -> Option<&Bio> {
+        // SAFETY: By type invariant of `Self`, `self.0` is valid and the deref
+        // is safe.
+        let ptr = unsafe { (*self.0.get()).bio };
+        // SAFETY: By C API contract, if `bio` is not null it will have a
+        // positive refcount at least for the duration of the lifetime of
+        // `&self`.
+        unsafe { Bio::from_raw(ptr) }
+    }
+
+    /// Get an iterator over all bio structurs in this request
+    #[inline(always)]
+    pub fn bio_iter(&self) -> BioIterator<'_> {
+        BioIterator { bio: self.bio() }
+    }
+
+    // TODO: Check if inline is still required for cross language LTO inlining into module
     /// Get the target sector for the request
     #[inline(always)]
     pub fn sector(&self) -> usize {
@@ -334,13 +354,14 @@ where
 
         // SAFETY: As we obtained `self_ptr` from a valid reference above, it
         // must point to a valid `U`.
-        let timer_ptr = unsafe { <T::RequestData as HasTimer<T::RequestData>>::raw_get_timer(request_data_ptr) };
+        let timer_ptr = unsafe {
+            <T::RequestData as HasTimer<T::RequestData>>::raw_get_timer(request_data_ptr)
+        };
 
         // SAFETY: As `timer_ptr` points into `U` and `U` is valid, `timer_ptr`
         // must point to a valid `Timer` instance.
         unsafe { Timer::<T::RequestData>::raw_cancel(timer_ptr) }
     }
-
 }
 
 impl<T> RequestTimerHandle<T>
@@ -362,11 +383,9 @@ where
     T: Operations,
     T::RequestData: HasTimer<T::RequestData>,
 {
-
     fn drop(&mut self) {
         self.cancel();
     }
-
 }
 
 impl<T> TimerPointer for ARef<Request<T>>
@@ -380,11 +399,9 @@ where
     fn start(self, expires: Ktime) -> RequestTimerHandle<T> {
         let pdu_ptr = self.data_ref() as *const T::RequestData;
 
-        unsafe{ T::RequestData::start(pdu_ptr, expires)};
+        unsafe { T::RequestData::start(pdu_ptr, expires) };
 
-        RequestTimerHandle {
-            inner: self,
-        }
+        RequestTimerHandle { inner: self }
     }
 }
 
@@ -407,14 +424,19 @@ where
         let offset = core::mem::offset_of!(RequestDataWrapper<T>, data);
 
         // SAFETY: This sub stays withing the `bindings::request` allocation and does not wrap
-        let pdu_ptr = unsafe { request_data_ptr.cast::<u8>().sub(offset).cast::<RequestDataWrapper<T>>() };
+        let pdu_ptr = unsafe {
+            request_data_ptr
+                .cast::<u8>()
+                .sub(offset)
+                .cast::<RequestDataWrapper<T>>()
+        };
 
         // SAFETY: The pointer was returned by `T::timer_container_of` so it
         // points to a valid `T::RequestDataWrapper`
         let request_ptr = unsafe { bindings::blk_mq_rq_from_pdu(pdu_ptr.cast::<c_void>()) };
 
         // TODO SAFETY
-        let request_ref = unsafe {&*(request_ptr as *const Request<T>)};
+        let request_ref = unsafe { &*(request_ptr as *const Request<T>) };
 
         let aref: ARef<Request<T>> = request_ref.into();
 
