@@ -345,6 +345,7 @@ impl<T: ?Sized> Arc<T> {
 unsafe impl<T: 'static> ForeignOwnable for Arc<T> {
     type PointedTo = ArcInner<T>;
     type Borrowed<'a> = ArcBorrow<'a, T>;
+    type BorrowedMut<'a> = Self::Borrowed<'a>;
 
     fn into_foreign(self) -> *mut Self::PointedTo {
         let ptr = self.ptr.as_ptr();
@@ -356,7 +357,6 @@ unsafe impl<T: 'static> ForeignOwnable for Arc<T> {
         // SAFETY: The safety requirements of this function ensure that `ptr` comes from a previous
         // call to `Self::into_foreign`.
         let inner = unsafe { NonNull::new_unchecked(ptr) };
-
         // SAFETY: By the safety requirement of this function, we know that `ptr` came from
         // a previous call to `Arc::into_foreign`, which guarantees that `ptr` is valid and
         // holds a reference count increment that is transferrable to us.
@@ -370,6 +370,12 @@ unsafe impl<T: 'static> ForeignOwnable for Arc<T> {
         // SAFETY: The safety requirements of `from_foreign` ensure that the object remains alive
         // for the lifetime of the returned value.
         unsafe { ArcBorrow::new(inner) }
+    }
+
+    unsafe fn borrow_mut<'a>(ptr: *mut Self::PointedTo) -> ArcBorrow<'a, T> {
+        // SAFETY: The safety requirements for `borrow_mut` are a superset of the safety
+        // requirements for `borrow`.
+        unsafe { Self::borrow(ptr) }
     }
 }
 
