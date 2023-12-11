@@ -234,6 +234,22 @@ impl<'a, T: ForeignOwnable> Guard<'a, T> {
         })
     }
 
+    /// Loads an entry from the array.
+    ///
+    /// Returns the entry at the given index.
+    pub fn load_mut(&mut self, index: usize) -> Option<T::BorrowedMut<'_>> {
+        // SAFETY: `self.xa` is always valid by the type invariant.
+        let ptr = unsafe { bindings::xa_load(self.xa.xa.get(), to_index(index)) };
+        (!ptr.is_null()).then(|| {
+            let ptr = ptr.cast();
+
+            // SAFETY: `ptr` is either NULL or came from `T::into_foreign`.
+            //
+            // SAFETY: `self` statically owns the only reference to the array.
+            unsafe { T::borrow_mut(ptr) }
+        })
+    }
+
     /// Erases an entry from the array.
     ///
     /// Returns the entry which was previously at the given index.
