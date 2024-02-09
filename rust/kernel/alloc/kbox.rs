@@ -353,6 +353,8 @@ impl<T: 'static, A> ForeignOwnable for Box<T, A>
 where
     A: Allocator,
 {
+    const FOREIGN_ALIGN: usize = core::mem::align_of::<T>();
+
     type Borrowed<'a> = &'a T;
     type BorrowedMut<'a> = &'a mut T;
 
@@ -383,6 +385,8 @@ impl<T: 'static, A> ForeignOwnable for Pin<Box<T, A>>
 where
     A: Allocator,
 {
+    const FOREIGN_ALIGN: usize = core::mem::align_of::<T>();
+
     type Borrowed<'a> = Pin<&'a T>;
     type BorrowedMut<'a> = Pin<&'a mut T>;
 
