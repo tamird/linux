@@ -106,7 +106,6 @@ impl<T> Timer<T> {
     /// # Safety
     ///
     /// `self_ptr` must point to a valid `Self`.
-    #[allow(dead_code)]
     unsafe fn raw_cancel(self_ptr: *const Self) -> bool {
         // SAFETY: timer_ptr points to an allocation of at least `Timer` size.
         let c_timer_ptr = unsafe { Timer::raw_get(self_ptr) };
@@ -301,3 +300,5 @@ macro_rules! impl_has_timer {
         }
     }
 }
+
+mod arc;
