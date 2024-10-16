@@ -4,13 +4,12 @@
 //!
 //! C header: [`include/linux/blk-mq.h`](srctree/include/linux/blk-mq.h)
 
-use kernel::hrtimer::RawTimer;
-
 use crate::{
     bindings,
     block::mq::Operations,
     error::{Error, Result},
-    hrtimer::{HasTimer, TimerCallback},
+    hrtimer::{HasTimer, Timer, TimerCallback, TimerHandle, TimerPointer},
+    time::Ktime,
     types::{ARef, AlwaysRefCounted, Opaque},
 };
 use core::{
@@ -316,34 +315,75 @@ fn atomic_relaxed_op_unless(target: &AtomicU64, op: impl Fn(u64) -> u64, pred: u
         .is_ok()
 }
 
-impl<T> RawTimer for ARef<Request<T>>
+/// A handle for a timer that is embedded in a [`Request`] private data area.
+pub struct RequestTimerHandle<T>
+where
+    T: Operations,
+    T::RequestData: HasTimer<T::RequestData>,
+{
+    inner: ARef<Request<T>>,
+}
+
+unsafe impl<T> TimerHandle for RequestTimerHandle<T>
+where
+    T: Operations,
+    T::RequestData: HasTimer<T::RequestData>,
+{
+    fn cancel(&mut self) -> bool {
+        let request_data_ptr = &self.inner.wrapper_ref().data as *const T::RequestData;
+
+        // SAFETY: As we obtained `self_ptr` from a valid reference above, it
+        // must point to a valid `U`.
+        let timer_ptr = unsafe { <T::RequestData as HasTimer<T::RequestData>>::raw_get_timer(request_data_ptr) };
+
+        // SAFETY: As `timer_ptr` points into `U` and `U` is valid, `timer_ptr`
+        // must point to a valid `Timer` instance.
+        unsafe { Timer::<T::RequestData>::raw_cancel(timer_ptr) }
+    }
+
+}
+
+impl<T> RequestTimerHandle<T>
+where
+    T: Operations,
+    T::RequestData: HasTimer<T::RequestData>,
+{
+    /// Drop the timer handle without cancelling the timer.
+    ///
+    /// This is safe because [`Request`] is not dropped during normal operations.
+    pub fn dismiss(mut self) {
+        unsafe { core::ptr::drop_in_place(&mut self.inner as *mut ARef<Request<T>>) };
+        core::mem::forget(self);
+    }
+}
+
+impl<T> Drop for RequestTimerHandle<T>
+where
+    T: Operations,
+    T::RequestData: HasTimer<T::RequestData>,
+{
+
+    fn drop(&mut self) {
+        self.cancel();
+    }
+
+}
+
+impl<T> TimerPointer for ARef<Request<T>>
 where
     T: Operations,
     T::RequestData: HasTimer<T::RequestData>,
     T::RequestData: Sync,
 {
-    fn schedule(self, expires: u64) {
+    type TimerHandle = RequestTimerHandle<T>;
+
+    fn start(self, expires: Ktime) -> RequestTimerHandle<T> {
         let pdu_ptr = self.data_ref() as *const T::RequestData;
-        core::mem::forget(self);
 
-        // SAFETY: `self_ptr` is a valid pointer to a `T::RequestData`
-        let timer_ptr = unsafe { T::RequestData::raw_get_timer(pdu_ptr) };
+        unsafe{ T::RequestData::start(pdu_ptr, expires)};
 
-        // `Timer` is `repr(transparent)`
-        let c_timer_ptr = timer_ptr.cast::<bindings::hrtimer>();
-
-        // Schedule the timer - if it is already scheduled it is removed and
-        // inserted
-
-        // SAFETY: c_timer_ptr points to a valid hrtimer instance that was
-        // initialized by `hrtimer_init`
-        unsafe {
-            bindings::hrtimer_start_range_ns(
-                c_timer_ptr as *mut _,
-                expires as i64,
-                0,
-                bindings::hrtimer_mode_HRTIMER_MODE_REL,
-            );
+        RequestTimerHandle {
+            inner: self,
         }
     }
 }
@@ -352,7 +392,8 @@ impl<T> kernel::hrtimer::RawTimerCallback for ARef<Request<T>>
 where
     T: Operations,
     T::RequestData: HasTimer<T::RequestData>,
-    T::RequestData: TimerCallback<Receiver = ARef<Request<T>>>,
+    T::RequestData: for<'a> TimerCallback<CallbackTarget<'a> = ARef<Request<T>>>,
+    T::RequestData: for<'a> TimerCallback<CallbackTargetParameter<'a> = ARef<Request<T>>>,
     T::RequestData: Sync,
 {
     unsafe extern "C" fn run(ptr: *mut bindings::hrtimer) -> bindings::hrtimer_restart {
@@ -361,24 +402,23 @@ where
 
         // SAFETY: By C API contract `ptr` is the pointer we passed when
         // enqueing the timer, so it is a `Timer<T::RequestData>` embedded in a `T::RequestData`
-        let receiver_ptr = unsafe { T::RequestData::timer_container_of(timer_ptr) };
+        let request_data_ptr = unsafe { T::RequestData::timer_container_of(timer_ptr) };
 
         let offset = core::mem::offset_of!(RequestDataWrapper<T>, data);
 
         // SAFETY: This sub stays withing the `bindings::request` allocation and does not wrap
-        let pdu_ptr = unsafe { receiver_ptr.cast::<u8>().sub(offset).cast::<RequestDataWrapper<T>>() };
+        let pdu_ptr = unsafe { request_data_ptr.cast::<u8>().sub(offset).cast::<RequestDataWrapper<T>>() };
 
         // SAFETY: The pointer was returned by `T::timer_container_of` so it
         // points to a valid `T::RequestDataWrapper`
         let request_ptr = unsafe { bindings::blk_mq_rq_from_pdu(pdu_ptr.cast::<c_void>()) };
 
-        // SAFETY: We own a refcount that we leaked during `RawTimer::schedule()`
-        let aref =
-            unsafe { ARef::from_raw(NonNull::new_unchecked(request_ptr.cast::<Request<T>>())) };
+        // TODO SAFETY
+        let request_ref = unsafe {&*(request_ptr as *const Request<T>)};
 
-        T::RequestData::run(aref);
+        let aref: ARef<Request<T>> = request_ref.into();
 
-        bindings::hrtimer_restart_HRTIMER_NORESTART
+        T::RequestData::run(aref).into()
     }
 }
 
