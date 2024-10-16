@@ -20,10 +20,11 @@ use kernel::{
         Operations, TagSet,
     },
     error::Result,
-    hrtimer::{RawTimer, TimerCallback},
+    hrtimer::{ClockSource, TimerCallback, TimerMode, TimerPointer, TimerRestart},
     new_mutex, pr_info,
     prelude::*,
     sync::{Arc, Mutex},
+    time::Ktime,
     types::{ARef, ForeignOwnable},
 };
 
@@ -90,11 +91,14 @@ impl kernel::Module for NullBlkModule {
         let tagset = Arc::pin_init(TagSet::new(1, (), 256, 1), flags::GFP_KERNEL)?;
 
         let irq_mode = (*param_irq_mode.read()).try_into()?;
+        pr_info!("IrqMode: {irq_mode:?}\n");
         let block_size = *param_block_size.read();
 
-        let queue_data = Box::pin_init(pin_init!(
-            QueueData {
-                completion_time_nsec: *param_completion_time_nsec.read(),
+        let queue_data = Box::try_pin_init(
+            try_pin_init!(QueueData {
+                completion_time_nsec: <u64 as TryInto<i64>>::try_into(
+                    *param_completion_time_nsec.read()
+                )?,
                 irq_mode,
                 block_size,
             }),
@@ -116,10 +120,9 @@ impl kernel::Module for NullBlkModule {
 
 struct NullBlkDevice;
 
-
 #[pin_data]
 struct QueueData {
-    completion_time_nsec: u64,
+    completion_time_nsec: i64,
     irq_mode: IRQMode,
     block_size: u16,
 }
@@ -131,12 +134,14 @@ struct Pdu {
 }
 
 impl TimerCallback for Pdu {
-    type Receiver = ARef<mq::Request<NullBlkDevice>>;
+    type CallbackTarget<'a> = ARef<mq::Request<NullBlkDevice>>;
+    type CallbackTargetParameter<'a> = ARef<mq::Request<NullBlkDevice>>;
 
-    fn run(this: Self::Receiver) {
+    fn run(this: Self::CallbackTargetParameter<'_>) -> TimerRestart {
         mq::Request::end_ok(this)
             .map_err(|_e| kernel::error::code::EIO)
             .expect("Failed to complete request");
+        TimerRestart::NoRestart
     }
 }
 
@@ -155,7 +160,7 @@ impl Operations for NullBlkDevice {
         _tagset_data: ForeignBorrowed<'_, Self::TagSetData>,
     ) -> impl PinInit<Self::RequestData> {
         pin_init!( Pdu {
-            timer <- kernel::hrtimer::Timer::new(),
+            timer <- kernel::hrtimer::Timer::new(TimerMode::Relative, ClockSource::Monotonic),
         })
     }
 
@@ -174,7 +179,9 @@ impl Operations for NullBlkDevice {
                 // point, and so `end_ok` cannot fail.
                 .expect("Fatal error - expected to be able to end request"),
             IRQMode::Soft => mq::Request::complete(rq),
-            IRQMode::Timer => rq.schedule(queue_data.completion_time_nsec),
+            IRQMode::Timer => {
+                rq.start(Ktime::from_ns(queue_data.completion_time_nsec)).dismiss();
+            }
         }
 
         Ok(())
