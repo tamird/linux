@@ -225,13 +225,15 @@ unsafe extern "C" fn fops_open<T: MiscDevice>(
         Ok(ptr) => ptr,
         Err(err) => return err.to_errno(),
     };
+    let ptr = ptr.into_foreign();
+    let ptr = ptr.cast();
 
     // This overwrites the private data with the value specified by the user, changing the type of
     // this file's private data. All future accesses to the private data is performed by other
     // fops_* methods in this file, which all correctly cast the private data to the new type.
     //
     // SAFETY: The open call of a file can access the private data.
-    unsafe { (*raw_file).private_data = ptr.into_foreign() };
+    unsafe { (*raw_file).private_data = ptr };
 
     0
 }
@@ -246,6 +248,7 @@ unsafe extern "C" fn fops_release<T: MiscDevice>(
 ) -> c_int {
     // SAFETY: The release call of a file owns the private data.
     let private = unsafe { (*file).private_data };
+    let private = private.cast();
     // SAFETY: The release call of a file owns the private data.
     let ptr = unsafe { <T::Ptr as ForeignOwnable>::from_foreign(private) };
 
@@ -267,6 +270,7 @@ unsafe extern "C" fn fops_ioctl<T: MiscDevice>(
 ) -> c_long {
     // SAFETY: The ioctl call of a file can access the private data.
     let private = unsafe { (*file).private_data };
+    let private = private.cast();
     // SAFETY: Ioctl calls can borrow the private data of the file.
     let device = unsafe { <T::Ptr as ForeignOwnable>::borrow(private) };
 
@@ -316,6 +320,7 @@ unsafe extern "C" fn fops_show_fdinfo<T: MiscDevice>(
 ) {
     // SAFETY: The release call of a file owns the private data.
     let private = unsafe { (*file).private_data };
+    let private = private.cast();
     // SAFETY: Ioctl calls can borrow the private data of the file.
     let device = unsafe { <T::Ptr as ForeignOwnable>::borrow(private) };
     // SAFETY:
