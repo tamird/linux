@@ -336,6 +336,13 @@ impl<T: 'static> ForeignOwnable for Arc<T> {
         ManuallyDrop::new(self).ptr.as_ptr() as _
     }
 
+    unsafe fn from_foreign(ptr: *const core::ffi::c_void) -> Self {
+        // SAFETY: By the safety requirement of this function, we know that `ptr` came from
+        // a previous call to `Arc::into_foreign`, which guarantees that `ptr` is valid and
+        // holds a reference count increment that is transferrable to us.
+        unsafe { Self::from_inner(NonNull::new(ptr as _).unwrap()) }
+    }
+
     unsafe fn borrow<'a>(ptr: *const core::ffi::c_void) -> ArcBorrow<'a, T> {
         // By the safety requirement of this function, we know that `ptr` came from
         // a previous call to `Arc::into_foreign`.
@@ -344,13 +351,6 @@ impl<T: 'static> ForeignOwnable for Arc<T> {
         // SAFETY: The safety requirements of `from_foreign` ensure that the object remains alive
         // for the lifetime of the returned value.
         unsafe { ArcBorrow::new(inner) }
-    }
-
-    unsafe fn from_foreign(ptr: *const core::ffi::c_void) -> Self {
-        // SAFETY: By the safety requirement of this function, we know that `ptr` came from
-        // a previous call to `Arc::into_foreign`, which guarantees that `ptr` is valid and
-        // holds a reference count increment that is transferrable to us.
-        unsafe { Self::from_inner(NonNull::new(ptr as _).unwrap()) }
     }
 }
 
