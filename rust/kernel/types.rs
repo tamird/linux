@@ -51,13 +51,11 @@ pub trait ForeignOwnable: Sized {
     /// `ptr` must either be null or satisfy the safety requirements for
     /// [`ForeignOwnable::from_foreign`].
     unsafe fn try_from_foreign(ptr: *const core::ffi::c_void) -> Option<Self> {
-        if ptr.is_null() {
-            None
-        } else {
+        (!ptr.is_null()).then(|| {
             // SAFETY: Since `ptr` is not null here, then `ptr` satisfies the safety requirements
             // of `from_foreign` given the safety requirements of this function.
-            unsafe { Some(Self::from_foreign(ptr)) }
-        }
+            unsafe { Self::from_foreign(ptr) }
+        })
     }
 
     /// Borrows a foreign-owned object.
