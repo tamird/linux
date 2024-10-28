@@ -290,7 +290,7 @@ impl<T: Operations> OperationsVTable<T> {
             // SAFETY: Because `set` is a `TagSet<T>`, `driver_data` comes from
             // a call to `into_foregn` by the initializer returned by
             // `TagSet::try_new`.
-            let tagset_data = unsafe { T::TagSetData::borrow((*set).driver_data) };
+            let tagset_data = unsafe { T::TagSetData::borrow((*set).driver_data.cast()) };
 
             let initializer = T::new_request_data(tagset_data);
 
