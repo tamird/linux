@@ -118,7 +118,7 @@ impl<T: Operations> OperationsVTable<T> {
         // SAFETY: The safety requirement for this function ensure that `hctx`
         // is valid and that `driver_data` was produced by a call to
         // `into_foreign` in `Self::init_hctx_callback`.
-        let hw_data = unsafe { T::HwData::borrow((*hctx).driver_data) };
+        let hw_data = unsafe { T::HwData::borrow((*hctx).driver_data.cast()) };
 
         // SAFETY: `hctx` is valid as required by this function.
         let queue_data = unsafe { (*(*hctx).queue).queuedata }.cast();
@@ -158,7 +158,7 @@ impl<T: Operations> OperationsVTable<T> {
     unsafe extern "C" fn commit_rqs_callback(hctx: *mut bindings::blk_mq_hw_ctx) {
         // SAFETY: `driver_data` was installed by us in `init_hctx_callback` as
         // the result of a call to `into_foreign`.
-        let hw_data = unsafe { T::HwData::borrow((*hctx).driver_data) };
+        let hw_data = unsafe { T::HwData::borrow((*hctx).driver_data.cast()) };
 
         // SAFETY: `hctx` is valid as required by this function.
         let queue_data = unsafe { (*(*hctx).queue).queuedata }.cast();
@@ -194,7 +194,7 @@ impl<T: Operations> OperationsVTable<T> {
         // SAFETY: By function safety requirement, `hctx` was initialized by
         // `init_hctx_callback` and thus `driver_data` came from a call to
         // `into_foreign`.
-        let hw_data = unsafe { T::HwData::borrow((*hctx).driver_data) };
+        let hw_data = unsafe { T::HwData::borrow((*hctx).driver_data.cast()) };
         T::poll(hw_data).into()
     }
 
@@ -218,7 +218,7 @@ impl<T: Operations> OperationsVTable<T> {
             // SAFETY: By the safety requirements of this function,
             // `tagset_data` came from a call to `into_foreign` when the
             // `TagSet` was initialized.
-            let tagset_data = unsafe { T::TagSetData::borrow(tagset_data) };
+            let tagset_data = unsafe { T::TagSetData::borrow(tagset_data.cast()) };
             let data = T::init_hctx(tagset_data, hctx_idx)?;
 
             // SAFETY: by the safety requirments of this function, `hctx` is
@@ -242,7 +242,7 @@ impl<T: Operations> OperationsVTable<T> {
         _hctx_idx: core::ffi::c_uint,
     ) {
         // SAFETY: By the safety requirements of this function, `hctx` is valid for read.
-        let ptr = unsafe { (*hctx).driver_data };
+        let ptr = unsafe { (*hctx).driver_data }.cast();
 
         // SAFETY: By the safety requirements of this function, `ptr` came from
         // a call to `into_foreign` in `init_hctx_callback`
