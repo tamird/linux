@@ -4,8 +4,7 @@
 //!
 //! C header: [`include/linux/moduleparam.h`](../../../include/linux/moduleparam.h)
 
-use crate::alloc::vec_ext::VecExt;
-use crate::alloc::flags;
+use crate::alloc::{flags, KVec};
 use crate::error::{code::*, from_result};
 use crate::str::{CStr, Formatter};
 use core::fmt::Write;
@@ -449,7 +448,7 @@ pub enum StringParam {
     ///
     /// The value needs to be freed when the parameter is reset or the module is
     /// unloaded.
-    Owned(alloc::vec::Vec<u8>),
+    Owned(KVec<u8>),
 }
 
 impl StringParam {
@@ -481,7 +480,7 @@ impl ModuleParam for StringParam {
         let slab_available = unsafe { crate::bindings::slab_is_available() };
         arg.and_then(|arg| {
             if slab_available {
-                let mut vec = alloc::vec::Vec::new();
+                let mut vec = KVec::new();
                 vec.extend_from_slice(arg, flags::GFP_KERNEL).ok()?;
                 Some(StringParam::Owned(vec))
             } else {
