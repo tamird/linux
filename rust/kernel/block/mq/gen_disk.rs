@@ -121,7 +121,7 @@ impl GenDiskBuilder {
             bindings::__blk_mq_alloc_disk(
                 tagset.raw_tag_set(),
                 &mut lim,
-                data.cast_mut(),
+                data.cast(),
                 static_lock_class!().as_ptr(),
             )
         })?;
@@ -244,7 +244,7 @@ impl<T: Operations> Drop for GenDisk<T> {
         // and initialized instance of `struct gendisk`, and, `queuedata` was
         // initialized with the result of a call to
         // `ForeignOwnable::into_foreign`.
-        let queue_data = unsafe { (*(*self.gendisk).queue).queuedata };
+        let queue_data = unsafe { (*(*self.gendisk).queue).queuedata }.cast();
 
         // SAFETY: By type invariant, `self.gendisk` points to a valid and
         // initialized instance of `struct gendisk`, and it was previously added

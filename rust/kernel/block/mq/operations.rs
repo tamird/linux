@@ -98,7 +98,7 @@ impl<T: Operations> OperationsVTable<T> {
         let rq = unsafe { Request::aref_from_raw((*bd).rq) };
 
         // SAFETY: `hctx` is valid as required by this function.
-        let queue_data = unsafe { (*(*hctx).queue).queuedata };
+        let queue_data = unsafe { (*(*hctx).queue).queuedata }.cast();
 
         // SAFETY: `queue.queuedata` was created by `GenDisk::try_new()` with a
         // call to `ForeignOwnable::into_pointer()` to create `queuedata`.
@@ -133,7 +133,7 @@ impl<T: Operations> OperationsVTable<T> {
     /// must ensure that `hctx` is valid.
     unsafe extern "C" fn commit_rqs_callback(hctx: *mut bindings::blk_mq_hw_ctx) {
         // SAFETY: `hctx` is valid as required by this function.
-        let queue_data = unsafe { (*(*hctx).queue).queuedata };
+        let queue_data = unsafe { (*(*hctx).queue).queuedata }.cast();
 
         // SAFETY: `queue.queuedata` was created by `GenDisk::try_new()` with a
         // call to `ForeignOwnable::into_pointer()` to create `queuedata`.
