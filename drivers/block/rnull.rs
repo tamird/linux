@@ -32,7 +32,7 @@ use kernel::{
     sync::{Arc, Mutex},
     time::Ktime,
     types::{ARef, ForeignOwnable},
-    xarray::XArray,
+    xarray::{AllocKind, XArray},
 };
 
 use kernel::new_spinlock;
@@ -138,7 +138,7 @@ impl kernel::Module for NullBlkModule {
 
 struct NullBlkDevice;
 
-type Tree = XArray<Box<Page>>;
+type Tree = XArray<KBox<Page>>;
 type TreeRef<'a> = &'a Tree;
 
 #[pin_data]
@@ -169,7 +169,7 @@ struct TreeContainer {
 impl TreeContainer {
     fn new() -> impl PinInit<Self> {
         pin_init!(TreeContainer {
-            tree <- CacheAligned::new_initializer(XArray::new(0)),
+            tree <- CacheAligned::new_initializer(XArray::new(AllocKind::Alloc)),
             lock <- CacheAligned::new_initializer(new_spinlock!((), "rnullb:mem")),
         })
     }
@@ -190,14 +190,26 @@ impl NullBlkDevice {
     fn write(tree: TreeRef<'_>, sector: usize, segment: &Segment<'_>) -> Result {
         let idx = sector >> bindings::PAGE_SECTORS_SHIFT;
 
-        let mut page = if let Some(page) = tree.get_locked(idx) {
-            page
-        } else {
-            tree.set(idx, Box::new(Page::alloc_page(flags::GFP_KERNEL)?, flags::GFP_KERNEL)?)?;
-            tree.get_locked(idx).unwrap()
-        };
+        let mut guard = tree.lock();
+        match guard.reserve(idx, flags::GFP_KERNEL) {
+            Ok(reservation) => {
+                let _: Option<_> = reservation
+                    .fill_locked(
+                        &mut guard,
+                        Box::new(Page::alloc_page(flags::GFP_KERNEL)?, flags::GFP_KERNEL)?,
+                    )
+                    .map_err(|(_, err)| err)?;
+            }
+            Err(EBUSY) => {
+                // Already populated.
+            }
+            err => {
+                err?;
+            }
+        }
+        let page = guard.load_mut(idx).unwrap();
 
-        segment.copy_to_page(&mut page)?;
+        segment.copy_to_page(page)?;
 
         Ok(())
     }
@@ -206,8 +218,9 @@ impl NullBlkDevice {
     fn read(tree: TreeRef<'_>, sector: usize, segment: &mut Segment<'_>) -> Result {
         let idx = sector >> bindings::PAGE_SECTORS_SHIFT;
 
-        if let Some(page) = tree.get_locked(idx) {
-            segment.copy_from_page(page.deref())?;
+        let mut guard = tree.lock();
+        if let Some(page) = guard.load_mut(idx) {
+            segment.copy_from_page(page)?;
         }
 
         Ok(())
@@ -253,7 +266,7 @@ kernel::impl_has_timer! {
 
 #[vtable]
 impl Operations for NullBlkDevice {
-    type QueueData = Pin<Box<QueueData>>;
+    type QueueData = Pin<KBox<QueueData>>;
     type TagSetData = ();
     type HwData = ();
     type RequestData = Pdu;
