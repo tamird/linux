@@ -7,6 +7,7 @@ use super::TimerCallback;
 use super::TimerHandle;
 use super::TimerPointer;
 use crate::prelude::*;
+use crate::alloc::Allocator;
 use crate::time::Ktime;
 use core::mem::ManuallyDrop;
 
@@ -45,12 +46,13 @@ where
     }
 }
 
-impl<U> TimerPointer for Pin<Box<U>>
+impl<U, A> TimerPointer for Pin<Box<U, A>>
 where
     U: Send + Sync,
     U: HasTimer<U>,
-    U: for<'a> TimerCallback<CallbackTarget<'a> = Pin<Box<U>>>,
+    U: for<'a> TimerCallback<CallbackTarget<'a> = Pin<Box<U, A>>>,
     U: for<'a> TimerCallback<CallbackTargetParameter<'a> = &'a U>,
+    A: Allocator,
 {
     type TimerHandle = BoxTimerHandle<U>;
 
@@ -72,11 +74,12 @@ where
     }
 }
 
-impl<U> RawTimerCallback for Pin<Box<U>>
+impl<U, A> RawTimerCallback for Pin<Box<U, A>>
 where
     U: HasTimer<U>,
-    U: for<'a> TimerCallback<CallbackTarget<'a> = Pin<Box<U>>>,
+    U: for<'a> TimerCallback<CallbackTarget<'a> = Pin<Box<U, A>>>,
     U: for<'a> TimerCallback<CallbackTargetParameter<'a> = &'a U>,
+    A: Allocator,
 {
     unsafe extern "C" fn run(ptr: *mut bindings::hrtimer) -> bindings::hrtimer_restart {
         // `Timer` is `repr(transparent)`
@@ -87,7 +90,7 @@ where
         let data_ptr = unsafe { U::timer_container_of(timer_ptr) };
 
         // SAFETY: We called `Box::into_raw` when we queued the timer.
-        let tbox = ManuallyDrop::new(unsafe { Box::from_raw(data_ptr) });
+        let tbox = ManuallyDrop::new(unsafe { Box::<_, A>::from_raw(data_ptr) });
 
         use core::ops::Deref;
         U::run(tbox.deref()).into()
