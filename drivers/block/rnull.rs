@@ -138,7 +138,7 @@ impl kernel::Module for NullBlkModule {
 
 struct NullBlkDevice;
 
-type Tree = XArray<Box<Page>>;
+type Tree = XArray<KBox<Page>>;
 type TreeRef<'a> = &'a Tree;
 
 #[pin_data]
