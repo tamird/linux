@@ -508,10 +508,10 @@ int blk_stack_limits(struct queue_limits *t, struct queue_limits *b,
 	t->features |= (b->features & BLK_FEAT_INHERIT_MASK);
 
 	/*
-	 * BLK_FEAT_NOWAIT and BLK_FEAT_POLL need to be supported both by the
-	 * stacking driver and all underlying devices.  The stacking driver sets
-	 * the flags before stacking the limits, and this will clear the flags
-	 * if any of the underlying devices does not support it.
+	 * Some feaures need to be supported both by the stacking driver and all
+	 * underlying devices.  The stacking driver sets these flags before
+	 * stacking the limits, and this will clear the flags if any of the
+	 * underlying devices does not support it.
 	 */
 	if (!(b->features & BLK_FEAT_NOWAIT))
 		t->features &= ~BLK_FEAT_NOWAIT;
@@ -661,7 +661,7 @@ EXPORT_SYMBOL(blk_stack_limits);
 void queue_limits_stack_bdev(struct queue_limits *t, struct block_device *bdev,
 		sector_t offset, const char *pfx)
 {
-	if (blk_stack_limits(t, &bdev_get_queue(bdev)->limits,
+	if (blk_stack_limits(t, bdev_limits(bdev),
 			get_start_sect(bdev) + offset))
 		pr_notice("%s: Warning: Device %pg is misaligned\n",
 			pfx, bdev);
