@@ -100,7 +100,7 @@ static ssize_t _name##_show(struct device *dev,			\
 {								\
 	struct memory_failure_stats *mf_stats =			\
 		&NODE_DATA(dev->id)->mf_stats;			\
-	return sprintf(buf, "%lu\n", mf_stats->_name);		\
+	return sysfs_emit(buf, "%lu\n", mf_stats->_name);	\
 }								\
 static DEVICE_ATTR_RO(_name)
 
@@ -2573,6 +2573,13 @@ int unpoison_memory(unsigned long pfn)
 
 	if (is_huge_zero_folio(folio)) {
 		unpoison_pr_info("%#lx: huge zero page is not supported\n",
+				 pfn, &unpoison_rs);
+		ret = -EOPNOTSUPP;
+		goto unlock_mutex;
+	}
+
+	if (PagePoisoned(p)) {
+		unpoison_pr_info("%#lx: page is uninitialized\n",
 				 pfn, &unpoison_rs);
 		ret = -EOPNOTSUPP;
 		goto unlock_mutex;
