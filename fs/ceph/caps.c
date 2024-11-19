@@ -978,20 +978,6 @@ int __ceph_caps_revoking_other(struct ceph_inode_info *ci,
 	return 0;
 }
 
-int ceph_caps_revoking(struct ceph_inode_info *ci, int mask)
-{
-	struct inode *inode = &ci->netfs.inode;
-	struct ceph_client *cl = ceph_inode_to_client(inode);
-	int ret;
-
-	spin_lock(&ci->i_ceph_lock);
-	ret = __ceph_caps_revoking_other(ci, NULL, mask);
-	spin_unlock(&ci->i_ceph_lock);
-	doutc(cl, "%p %llx.%llx %s = %d\n", inode, ceph_vinop(inode),
-	      ceph_cap_string(mask), ret);
-	return ret;
-}
-
 int __ceph_caps_used(struct ceph_inode_info *ci)
 {
 	int used = 0;
@@ -2813,7 +2799,7 @@ void ceph_take_cap_refs(struct ceph_inode_info *ci, int got,
  * requested from the MDS.
  *
  * Returns 0 if caps were not able to be acquired (yet), 1 if succeed,
- * or a negative error code. There are 3 speical error codes:
+ * or a negative error code. There are 3 special error codes:
  *  -EAGAIN:  need to sleep but non-blocking is specified
  *  -EFBIG:   ask caller to call check_max_size() and try again.
  *  -EUCLEAN: ask caller to call ceph_renew_caps() and try again.
