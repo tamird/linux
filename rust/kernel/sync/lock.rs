@@ -9,7 +9,7 @@ use super::LockClassKey;
 use crate::{
     init::PinInit,
     pin_init,
-    str::CStr,
+    str::{CStr, CStrExt as _},
     types::{NotThreadSafe, Opaque, ScopeGuard},
 };
 use core::{cell::UnsafeCell, marker::PhantomPinned};

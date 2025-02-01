@@ -10,7 +10,7 @@ use crate::{
     ffi::{c_int, c_long},
     init::PinInit,
     pin_init,
-    str::CStr,
+    str::{CStr, CStrExt as _},
     task::{MAX_SCHEDULE_TIMEOUT, TASK_INTERRUPTIBLE, TASK_NORMAL, TASK_UNINTERRUPTIBLE},
     time::Jiffies,
     types::Opaque,
