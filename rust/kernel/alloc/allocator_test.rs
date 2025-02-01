@@ -62,9 +62,21 @@ unsafe impl Allocator for Cmalloc {
             ));
         }
 
+        // According to `man aligned_alloc`:
+        //
+        // aligned_alloc() returns a NULL pointer and sets errno to EINVAL if size is not an
+        // integral multiple of alignment, or if alignment is not a power of 2 at least as large as
+        // sizeof(void *).
+        let min_align = core::mem::size_of::<*const crate::ffi::c_void>();
+        let (align, size) = if layout.align() < min_align {
+            (min_align, layout.size().div_ceil(min_align) * min_align)
+        } else {
+            (layout.align(), layout.size())
+        };
+
         // SAFETY: Returns either NULL or a pointer to a memory allocation that satisfies or
         // exceeds the given size and alignment requirements.
-        let dst = unsafe { libc_aligned_alloc(layout.align(), layout.size()) } as *mut u8;
+        let dst = unsafe { libc_aligned_alloc(align, size) } as *mut u8;
         let dst = NonNull::new(dst).ok_or(AllocError)?;
 
         if flags.contains(__GFP_ZERO) {
