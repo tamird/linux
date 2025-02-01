@@ -10,11 +10,12 @@ use crate::{
     ffi::{c_int, c_long},
     init::PinInit,
     pin_init,
-    str::{CStr, CStrExt as _},
+    str::CStrExt as _,
     task::{MAX_SCHEDULE_TIMEOUT, TASK_INTERRUPTIBLE, TASK_NORMAL, TASK_UNINTERRUPTIBLE},
     time::Jiffies,
     types::Opaque,
 };
+use core::ffi::CStr;
 use core::marker::PhantomPinned;
 use core::ptr;
 use macros::pin_data;

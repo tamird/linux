@@ -9,10 +9,10 @@ use super::LockClassKey;
 use crate::{
     init::PinInit,
     pin_init,
-    str::{CStr, CStrExt as _},
+    str::CStrExt as _,
     types::{NotThreadSafe, Opaque, ScopeGuard},
 };
-use core::{cell::UnsafeCell, marker::PhantomPinned};
+use core::{cell::UnsafeCell, ffi::CStr, marker::PhantomPinned};
 use macros::pin_data;
 
 pub mod mutex;
