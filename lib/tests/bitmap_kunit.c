@@ -3,10 +3,8 @@
  * Test cases for bitmap API.
  */
 
-#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
-
+#include <kunit/test.h>
 #include <linux/bitmap.h>
-#include <linux/init.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/printk.h>
@@ -14,16 +12,16 @@
 #include <linux/string.h>
 #include <linux/uaccess.h>
 
-#include "../tools/testing/selftests/kselftest_module.h"
+#define EXP1_IN_BITS (sizeof(exp1) * 8)
 
-#define EXP1_IN_BITS	(sizeof(exp1) * 8)
+static char pbl_buffer[PAGE_SIZE];
+static char print_buf[PAGE_SIZE * 2];
 
-KSTM_MODULE_GLOBALS();
+static struct kunit *kunittest;
 
-static char pbl_buffer[PAGE_SIZE] __initdata;
-static char print_buf[PAGE_SIZE * 2] __initdata;
+#define tc_err(fmt, ...) KUNIT_FAIL(kunittest, fmt, ##__VA_ARGS__)
 
-static const unsigned long exp1[] __initconst = {
+static const unsigned long exp1[] = {
 	BITMAP_FROM_U64(1),
 	BITMAP_FROM_U64(2),
 	BITMAP_FROM_U64(0x0000ffff),
@@ -41,130 +39,61 @@ static const unsigned long exp1[] __initconst = {
 	BITMAP_FROM_U64(0x80000000),
 };
 
-static const unsigned long exp2[] __initconst = {
+static const unsigned long exp2[] = {
 	BITMAP_FROM_U64(0x3333333311111111ULL),
 	BITMAP_FROM_U64(0xffffffff77777777ULL),
 };
 
 /* Fibonacci sequence */
-static const unsigned long exp2_to_exp3_mask[] __initconst = {
+static const unsigned long exp2_to_exp3_mask[] = {
 	BITMAP_FROM_U64(0x008000020020212eULL),
 };
 /* exp3_0_1 = (exp2[0] & ~exp2_to_exp3_mask) | (exp2[1] & exp2_to_exp3_mask) */
-static const unsigned long exp3_0_1[] __initconst = {
+static const unsigned long exp3_0_1[] = {
 	BITMAP_FROM_U64(0x33b3333311313137ULL),
 };
 /* exp3_1_0 = (exp2[1] & ~exp2_to_exp3_mask) | (exp2[0] & exp2_to_exp3_mask) */
-static const unsigned long exp3_1_0[] __initconst = {
+static const unsigned long exp3_1_0[] = {
 	BITMAP_FROM_U64(0xff7fffff77575751ULL),
 };
 
-static bool __init
-__check_eq_ulong(const char *srcfile, unsigned int line,
-		 const unsigned long exp_ulong, unsigned long x)
-{
-	if (exp_ulong != x) {
-		pr_err("[%s:%u] expected %lu, got %lu\n",
-			srcfile, line, exp_ulong, x);
-		return false;
-	}
-	return true;
-}
+#define expect_eq_ulong(exp_ulong, x) KUNIT_EXPECT_EQ(kunittest, exp_ulong, x)
 
-static bool __init
-__check_eq_bitmap(const char *srcfile, unsigned int line,
-		  const unsigned long *exp_bmap, const unsigned long *bmap,
-		  unsigned int nbits)
-{
-	if (!bitmap_equal(exp_bmap, bmap, nbits)) {
-		pr_warn("[%s:%u] bitmaps contents differ: expected \"%*pbl\", got \"%*pbl\"\n",
-			srcfile, line,
-			nbits, exp_bmap, nbits, bmap);
-		return false;
-	}
-	return true;
-}
+#define expect_eq_bitmap(exp_bmap, bmap, nbits)                               \
+	KUNIT_EXPECT_TRUE_MSG(                                                \
+		kunittest, bitmap_equal(exp_bmap, bmap, nbits),               \
+		"bitmaps contents differ: expected \"%*pbl\", got \"%*pbl\"", \
+		nbits, exp_bmap, nbits, bmap)
 
-static bool __init
-__check_eq_pbl(const char *srcfile, unsigned int line,
-	       const char *expected_pbl,
-	       const unsigned long *bitmap, unsigned int nbits)
-{
-	snprintf(pbl_buffer, sizeof(pbl_buffer), "%*pbl", nbits, bitmap);
-	if (strcmp(expected_pbl, pbl_buffer)) {
-		pr_warn("[%s:%u] expected \"%s\", got \"%s\"\n",
-			srcfile, line,
-			expected_pbl, pbl_buffer);
-		return false;
-	}
-	return true;
-}
+#define expect_eq_pbl(expected_pbl, bitmap, nbits)                       \
+	do {                                                             \
+		snprintf(pbl_buffer, sizeof(pbl_buffer), "%*pbl", nbits, \
+			 bitmap);                                        \
+		KUNIT_EXPECT_STREQ(kunittest, expected_pbl, pbl_buffer); \
+	} while (0)
 
-static bool __init __check_eq_clump8(const char *srcfile, unsigned int line,
-				    const unsigned int offset,
-				    const unsigned int size,
-				    const unsigned char *const clump_exp,
-				    const unsigned long *const clump)
-{
-	unsigned long exp;
+#define expect_eq_clump8(offset, size, clump_exp, clump)                     \
+	do {                                                                 \
+		unsigned long exp;                                           \
+		KUNIT_EXPECT_LT_MSG(kunittest, offset, size,                 \
+				    "bit offset for clump out-of-bounds");   \
+		exp = clump_exp[offset / 8];                                 \
+		KUNIT_EXPECT_NE_MSG(kunittest, exp, 0,                       \
+				    "bit offset %u for zero clump", offset); \
+		KUNIT_EXPECT_EQ(kunittest, *clump, exp);                     \
+	} while (0)
 
-	if (offset >= size) {
-		pr_warn("[%s:%u] bit offset for clump out-of-bounds: expected less than %u, got %u\n",
-			srcfile, line, size, offset);
-		return false;
+#define expect_eq_str(exp_str, str, len)                             \
+	{                                                            \
+		if (strncmp(exp_str, str, len) != 0) {               \
+			tc_err("expected %s, got %s", exp_str, str); \
+		}                                                    \
 	}
 
-	exp = clump_exp[offset / 8];
-	if (!exp) {
-		pr_warn("[%s:%u] bit offset for zero clump: expected nonzero clump, got bit offset %u with clump value 0",
-			srcfile, line, offset);
-		return false;
-	}
+#define expect_eq_uint(x, y) \
+	expect_eq_ulong((unsigned int)(x), (unsigned int)(y))
 
-	if (*clump != exp) {
-		pr_warn("[%s:%u] expected clump value of 0x%lX, got clump value of 0x%lX",
-			srcfile, line, exp, *clump);
-		return false;
-	}
-
-	return true;
-}
-
-static bool __init
-__check_eq_str(const char *srcfile, unsigned int line,
-		const char *exp_str, const char *str,
-		unsigned int len)
-{
-	bool eq;
-
-	eq = strncmp(exp_str, str, len) == 0;
-	if (!eq)
-		pr_err("[%s:%u] expected %s, got %s\n", srcfile, line, exp_str, str);
-
-	return eq;
-}
-
-#define __expect_eq(suffix, ...)					\
-	({								\
-		int result = 0;						\
-		total_tests++;						\
-		if (!__check_eq_ ## suffix(__FILE__, __LINE__,		\
-					   ##__VA_ARGS__)) {		\
-			failed_tests++;					\
-			result = 1;					\
-		}							\
-		result;							\
-	})
-
-#define expect_eq_ulong(...)		__expect_eq(ulong, ##__VA_ARGS__)
-#define expect_eq_uint(x, y)		expect_eq_ulong((unsigned int)(x), (unsigned int)(y))
-#define expect_eq_bitmap(...)		__expect_eq(bitmap, ##__VA_ARGS__)
-#define expect_eq_pbl(...)		__expect_eq(pbl, ##__VA_ARGS__)
-#define expect_eq_u32_array(...)	__expect_eq(u32_array, ##__VA_ARGS__)
-#define expect_eq_clump8(...)		__expect_eq(clump8, ##__VA_ARGS__)
-#define expect_eq_str(...)		__expect_eq(str, ##__VA_ARGS__)
-
-static void __init test_zero_clear(void)
+static void test_zero_clear(void)
 {
 	DECLARE_BITMAP(bmap, 1024);
 
@@ -193,7 +122,7 @@ static void __init test_zero_clear(void)
 	expect_eq_pbl("", bmap, 1024);
 }
 
-static void __init test_find_nth_bit(void)
+static void test_find_nth_bit(void)
 {
 	unsigned long b, bit, cnt = 0;
 	DECLARE_BITMAP(bmap, 64 * 3);
@@ -208,25 +137,25 @@ static void __init test_find_nth_bit(void)
 	__set_bit(80, bmap);
 	__set_bit(123, bmap);
 
-	expect_eq_uint(10,  find_nth_bit(bmap, 64 * 3, 0));
-	expect_eq_uint(20,  find_nth_bit(bmap, 64 * 3, 1));
-	expect_eq_uint(30,  find_nth_bit(bmap, 64 * 3, 2));
-	expect_eq_uint(40,  find_nth_bit(bmap, 64 * 3, 3));
-	expect_eq_uint(50,  find_nth_bit(bmap, 64 * 3, 4));
-	expect_eq_uint(60,  find_nth_bit(bmap, 64 * 3, 5));
-	expect_eq_uint(80,  find_nth_bit(bmap, 64 * 3, 6));
+	expect_eq_uint(10, find_nth_bit(bmap, 64 * 3, 0));
+	expect_eq_uint(20, find_nth_bit(bmap, 64 * 3, 1));
+	expect_eq_uint(30, find_nth_bit(bmap, 64 * 3, 2));
+	expect_eq_uint(40, find_nth_bit(bmap, 64 * 3, 3));
+	expect_eq_uint(50, find_nth_bit(bmap, 64 * 3, 4));
+	expect_eq_uint(60, find_nth_bit(bmap, 64 * 3, 5));
+	expect_eq_uint(80, find_nth_bit(bmap, 64 * 3, 6));
 	expect_eq_uint(123, find_nth_bit(bmap, 64 * 3, 7));
-	expect_eq_uint(0,   !!(find_nth_bit(bmap, 64 * 3, 8) < 64 * 3));
+	expect_eq_uint(0, !!(find_nth_bit(bmap, 64 * 3, 8) < 64 * 3));
 
-	expect_eq_uint(10,  find_nth_bit(bmap, 64 * 3 - 1, 0));
-	expect_eq_uint(20,  find_nth_bit(bmap, 64 * 3 - 1, 1));
-	expect_eq_uint(30,  find_nth_bit(bmap, 64 * 3 - 1, 2));
-	expect_eq_uint(40,  find_nth_bit(bmap, 64 * 3 - 1, 3));
-	expect_eq_uint(50,  find_nth_bit(bmap, 64 * 3 - 1, 4));
-	expect_eq_uint(60,  find_nth_bit(bmap, 64 * 3 - 1, 5));
-	expect_eq_uint(80,  find_nth_bit(bmap, 64 * 3 - 1, 6));
+	expect_eq_uint(10, find_nth_bit(bmap, 64 * 3 - 1, 0));
+	expect_eq_uint(20, find_nth_bit(bmap, 64 * 3 - 1, 1));
+	expect_eq_uint(30, find_nth_bit(bmap, 64 * 3 - 1, 2));
+	expect_eq_uint(40, find_nth_bit(bmap, 64 * 3 - 1, 3));
+	expect_eq_uint(50, find_nth_bit(bmap, 64 * 3 - 1, 4));
+	expect_eq_uint(60, find_nth_bit(bmap, 64 * 3 - 1, 5));
+	expect_eq_uint(80, find_nth_bit(bmap, 64 * 3 - 1, 6));
 	expect_eq_uint(123, find_nth_bit(bmap, 64 * 3 - 1, 7));
-	expect_eq_uint(0,   !!(find_nth_bit(bmap, 64 * 3 - 1, 8) < 64 * 3 - 1));
+	expect_eq_uint(0, !!(find_nth_bit(bmap, 64 * 3 - 1, 8) < 64 * 3 - 1));
 
 	for_each_set_bit(bit, exp1, EXP1_IN_BITS) {
 		b = find_nth_bit(exp1, EXP1_IN_BITS, cnt++);
@@ -234,8 +163,7 @@ static void __init test_find_nth_bit(void)
 	}
 }
 
-static void __init
-test_bitmap_find_next_zero_area_off(void)
+static void test_bitmap_find_next_zero_area_off(void)
 {
 	DECLARE_BITMAP(bmap, 192);
 
@@ -252,26 +180,26 @@ test_bitmap_find_next_zero_area_off(void)
 	bitmap_clear(bmap, 160, 32);
 
 	expect_eq_uint(0,
-		bitmap_find_next_zero_area_off(bmap, 192, 0, 8, 0, 0));
+		       bitmap_find_next_zero_area_off(bmap, 192, 0, 8, 0, 0));
 	expect_eq_uint(0,
-		bitmap_find_next_zero_area_off(bmap, 192, 0, 8, 3, 0));
+		       bitmap_find_next_zero_area_off(bmap, 192, 0, 8, 3, 0));
 	expect_eq_uint(163,
-		bitmap_find_next_zero_area_off(bmap, 192, 0, 8, 3, 1));
+		       bitmap_find_next_zero_area_off(bmap, 192, 0, 8, 3, 1));
 	expect_eq_uint(60,
-		bitmap_find_next_zero_area_off(bmap, 192, 1, 8, 0, 0));
+		       bitmap_find_next_zero_area_off(bmap, 192, 1, 8, 0, 0));
 	expect_eq_uint(160,
-		bitmap_find_next_zero_area_off(bmap, 192, 1, 8, 7, 0));
+		       bitmap_find_next_zero_area_off(bmap, 192, 1, 8, 7, 0));
 	expect_eq_uint(60,
-		bitmap_find_next_zero_area_off(bmap, 192, 1, 8, 7, 4));
+		       bitmap_find_next_zero_area_off(bmap, 192, 1, 8, 7, 4));
 	expect_eq_uint(100,
-		bitmap_find_next_zero_area_off(bmap, 192, 0, 10, 0, 0));
+		       bitmap_find_next_zero_area_off(bmap, 192, 0, 10, 0, 0));
 	expect_eq_uint(160,
-		bitmap_find_next_zero_area_off(bmap, 192, 0, 32, 0, 0));
-	expect_eq_uint(1,
-		!!(bitmap_find_next_zero_area_off(bmap, 192, 0, 33, 0, 0) >= 192));
+		       bitmap_find_next_zero_area_off(bmap, 192, 0, 32, 0, 0));
+	expect_eq_uint(1, !!(bitmap_find_next_zero_area_off(bmap, 192, 0, 33, 0,
+							    0) >= 192));
 }
 
-static void __init test_fill_set(void)
+static void test_fill_set(void)
 {
 	DECLARE_BITMAP(bmap, 1024);
 
@@ -300,7 +228,7 @@ static void __init test_fill_set(void)
 	expect_eq_pbl("0-1023", bmap, 1024);
 }
 
-static void __init test_copy(void)
+static void test_copy(void)
 {
 	DECLARE_BITMAP(bmap1, 1024);
 	DECLARE_BITMAP(bmap2, 1024);
@@ -331,15 +259,15 @@ static void __init test_copy(void)
 	 */
 
 	bitmap_fill(bmap2, 1024);
-	bitmap_copy(bmap2, bmap1, 109);  /* ... but 0-padded til word length */
+	bitmap_copy(bmap2, bmap1, 109); /* ... but 0-padded til word length */
 	expect_eq_pbl("0-108,128-1023", bmap2, 1024);
 
 	bitmap_fill(bmap2, 1024);
-	bitmap_copy(bmap2, bmap1, 97);  /* ... but aligned on word length */
+	bitmap_copy(bmap2, bmap1, 97); /* ... but aligned on word length */
 	expect_eq_pbl("0-108,128-1023", bmap2, 1024);
 }
 
-static void __init test_bitmap_region(void)
+static void test_bitmap_region(void)
 {
 	int pos, order;
 
@@ -362,9 +290,9 @@ static void __init test_bitmap_region(void)
 	expect_eq_uint(bitmap_weight(bmap, 1000), 0);
 }
 
-#define EXP2_IN_BITS	(sizeof(exp2) * 8)
+#define EXP2_IN_BITS (sizeof(exp2) * 8)
 
-static void __init test_replace(void)
+static void test_replace(void)
 {
 	unsigned int nbits = 64;
 	unsigned int nlongs = DIV_ROUND_UP(nbits, BITS_PER_LONG);
@@ -373,43 +301,47 @@ static void __init test_replace(void)
 	BUILD_BUG_ON(EXP2_IN_BITS < nbits * 2);
 
 	bitmap_zero(bmap, 1024);
-	bitmap_replace(bmap, &exp2[0 * nlongs], &exp2[1 * nlongs], exp2_to_exp3_mask, nbits);
+	bitmap_replace(bmap, &exp2[0 * nlongs], &exp2[1 * nlongs],
+		       exp2_to_exp3_mask, nbits);
 	expect_eq_bitmap(bmap, exp3_0_1, nbits);
 
 	bitmap_zero(bmap, 1024);
-	bitmap_replace(bmap, &exp2[1 * nlongs], &exp2[0 * nlongs], exp2_to_exp3_mask, nbits);
+	bitmap_replace(bmap, &exp2[1 * nlongs], &exp2[0 * nlongs],
+		       exp2_to_exp3_mask, nbits);
 	expect_eq_bitmap(bmap, exp3_1_0, nbits);
 
 	bitmap_fill(bmap, 1024);
-	bitmap_replace(bmap, &exp2[0 * nlongs], &exp2[1 * nlongs], exp2_to_exp3_mask, nbits);
+	bitmap_replace(bmap, &exp2[0 * nlongs], &exp2[1 * nlongs],
+		       exp2_to_exp3_mask, nbits);
 	expect_eq_bitmap(bmap, exp3_0_1, nbits);
 
 	bitmap_fill(bmap, 1024);
-	bitmap_replace(bmap, &exp2[1 * nlongs], &exp2[0 * nlongs], exp2_to_exp3_mask, nbits);
+	bitmap_replace(bmap, &exp2[1 * nlongs], &exp2[0 * nlongs],
+		       exp2_to_exp3_mask, nbits);
 	expect_eq_bitmap(bmap, exp3_1_0, nbits);
 }
 
-static const unsigned long sg_mask[] __initconst = {
+static const unsigned long sg_mask[] = {
 	BITMAP_FROM_U64(0x000000000000035aULL),
 	BITMAP_FROM_U64(0x0000000000000000ULL),
 };
 
-static const unsigned long sg_src[] __initconst = {
+static const unsigned long sg_src[] = {
 	BITMAP_FROM_U64(0x0000000000000667ULL),
 	BITMAP_FROM_U64(0x0000000000000000ULL),
 };
 
-static const unsigned long sg_gather_exp[] __initconst = {
+static const unsigned long sg_gather_exp[] = {
 	BITMAP_FROM_U64(0x0000000000000029ULL),
 	BITMAP_FROM_U64(0x0000000000000000ULL),
 };
 
-static const unsigned long sg_scatter_exp[] __initconst = {
+static const unsigned long sg_scatter_exp[] = {
 	BITMAP_FROM_U64(0x000000000000021aULL),
 	BITMAP_FROM_U64(0x0000000000000000ULL),
 };
 
-static void __init test_bitmap_sg(void)
+static void test_bitmap_sg(void)
 {
 	unsigned int nbits = 64;
 	DECLARE_BITMAP(bmap_gather, 100);
@@ -435,10 +367,10 @@ static void __init test_bitmap_sg(void)
 	expect_eq_bitmap(bmap_scatter, bmap_res, 100);
 }
 
-#define PARSE_TIME	0x1
-#define NO_LEN		0x2
+#define PARSE_TIME 0x1
+#define NO_LEN 0x2
 
-struct test_bitmap_parselist{
+struct test_bitmap_parselist {
 	const int errno;
 	const char *in;
 	const unsigned long *expected;
@@ -446,92 +378,92 @@ struct test_bitmap_parselist{
 	const int flags;
 };
 
-static const struct test_bitmap_parselist parselist_tests[] __initconst = {
+static const struct test_bitmap_parselist parselist_tests[] = {
 #define step (sizeof(u64) / sizeof(unsigned long))
 
-	{0, "0",			&exp1[0], 8, 0},
-	{0, "1",			&exp1[1 * step], 8, 0},
-	{0, "0-15",			&exp1[2 * step], 32, 0},
-	{0, "16-31",			&exp1[3 * step], 32, 0},
-	{0, "0-31:1/2",			&exp1[4 * step], 32, 0},
-	{0, "1-31:1/2",			&exp1[5 * step], 32, 0},
-	{0, "0-31:1/4",			&exp1[6 * step], 32, 0},
-	{0, "1-31:1/4",			&exp1[7 * step], 32, 0},
-	{0, "0-31:4/4",			&exp1[8 * step], 32, 0},
-	{0, "1-31:4/4",			&exp1[9 * step], 32, 0},
-	{0, "0-31:1/4,32-63:2/4",	&exp1[10 * step], 64, 0},
-	{0, "0-31:3/4,32-63:4/4",	&exp1[11 * step], 64, 0},
-	{0, "  ,,  0-31:3/4  ,, 32-63:4/4  ,,  ",	&exp1[11 * step], 64, 0},
+	{ 0, "0", &exp1[0], 8, 0 },
+	{ 0, "1", &exp1[1 * step], 8, 0 },
+	{ 0, "0-15", &exp1[2 * step], 32, 0 },
+	{ 0, "16-31", &exp1[3 * step], 32, 0 },
+	{ 0, "0-31:1/2", &exp1[4 * step], 32, 0 },
+	{ 0, "1-31:1/2", &exp1[5 * step], 32, 0 },
+	{ 0, "0-31:1/4", &exp1[6 * step], 32, 0 },
+	{ 0, "1-31:1/4", &exp1[7 * step], 32, 0 },
+	{ 0, "0-31:4/4", &exp1[8 * step], 32, 0 },
+	{ 0, "1-31:4/4", &exp1[9 * step], 32, 0 },
+	{ 0, "0-31:1/4,32-63:2/4", &exp1[10 * step], 64, 0 },
+	{ 0, "0-31:3/4,32-63:4/4", &exp1[11 * step], 64, 0 },
+	{ 0, "  ,,  0-31:3/4  ,, 32-63:4/4  ,,  ", &exp1[11 * step], 64, 0 },
 
-	{0, "0-31:1/4,32-63:2/4,64-95:3/4,96-127:4/4",	exp2, 128, 0},
+	{ 0, "0-31:1/4,32-63:2/4,64-95:3/4,96-127:4/4", exp2, 128, 0 },
 
-	{0, "0-2047:128/256", NULL, 2048, PARSE_TIME},
+	{ 0, "0-2047:128/256", NULL, 2048, PARSE_TIME },
 
-	{0, "",				&exp1[12 * step], 8, 0},
-	{0, "\n",			&exp1[12 * step], 8, 0},
-	{0, ",,  ,,  , ,  ,",		&exp1[12 * step], 8, 0},
-	{0, " ,  ,,  , ,   ",		&exp1[12 * step], 8, 0},
-	{0, " ,  ,,  , ,   \n",		&exp1[12 * step], 8, 0},
+	{ 0, "", &exp1[12 * step], 8, 0 },
+	{ 0, "\n", &exp1[12 * step], 8, 0 },
+	{ 0, ",,  ,,  , ,  ,", &exp1[12 * step], 8, 0 },
+	{ 0, " ,  ,,  , ,   ", &exp1[12 * step], 8, 0 },
+	{ 0, " ,  ,,  , ,   \n", &exp1[12 * step], 8, 0 },
 
-	{0, "0-0",			&exp1[0], 32, 0},
-	{0, "1-1",			&exp1[1 * step], 32, 0},
-	{0, "15-15",			&exp1[13 * step], 32, 0},
-	{0, "31-31",			&exp1[14 * step], 32, 0},
+	{ 0, "0-0", &exp1[0], 32, 0 },
+	{ 0, "1-1", &exp1[1 * step], 32, 0 },
+	{ 0, "15-15", &exp1[13 * step], 32, 0 },
+	{ 0, "31-31", &exp1[14 * step], 32, 0 },
 
-	{0, "0-0:0/1",			&exp1[12 * step], 32, 0},
-	{0, "0-0:1/1",			&exp1[0], 32, 0},
-	{0, "0-0:1/31",			&exp1[0], 32, 0},
-	{0, "0-0:31/31",		&exp1[0], 32, 0},
-	{0, "1-1:1/1",			&exp1[1 * step], 32, 0},
-	{0, "0-15:16/31",		&exp1[2 * step], 32, 0},
-	{0, "15-15:1/2",		&exp1[13 * step], 32, 0},
-	{0, "15-15:31/31",		&exp1[13 * step], 32, 0},
-	{0, "15-31:1/31",		&exp1[13 * step], 32, 0},
-	{0, "16-31:16/31",		&exp1[3 * step], 32, 0},
-	{0, "31-31:31/31",		&exp1[14 * step], 32, 0},
+	{ 0, "0-0:0/1", &exp1[12 * step], 32, 0 },
+	{ 0, "0-0:1/1", &exp1[0], 32, 0 },
+	{ 0, "0-0:1/31", &exp1[0], 32, 0 },
+	{ 0, "0-0:31/31", &exp1[0], 32, 0 },
+	{ 0, "1-1:1/1", &exp1[1 * step], 32, 0 },
+	{ 0, "0-15:16/31", &exp1[2 * step], 32, 0 },
+	{ 0, "15-15:1/2", &exp1[13 * step], 32, 0 },
+	{ 0, "15-15:31/31", &exp1[13 * step], 32, 0 },
+	{ 0, "15-31:1/31", &exp1[13 * step], 32, 0 },
+	{ 0, "16-31:16/31", &exp1[3 * step], 32, 0 },
+	{ 0, "31-31:31/31", &exp1[14 * step], 32, 0 },
 
-	{0, "N-N",			&exp1[14 * step], 32, 0},
-	{0, "0-0:1/N",			&exp1[0], 32, 0},
-	{0, "0-0:N/N",			&exp1[0], 32, 0},
-	{0, "0-15:16/N",		&exp1[2 * step], 32, 0},
-	{0, "15-15:N/N",		&exp1[13 * step], 32, 0},
-	{0, "15-N:1/N",			&exp1[13 * step], 32, 0},
-	{0, "16-N:16/N",		&exp1[3 * step], 32, 0},
-	{0, "N-N:N/N",			&exp1[14 * step], 32, 0},
+	{ 0, "N-N", &exp1[14 * step], 32, 0 },
+	{ 0, "0-0:1/N", &exp1[0], 32, 0 },
+	{ 0, "0-0:N/N", &exp1[0], 32, 0 },
+	{ 0, "0-15:16/N", &exp1[2 * step], 32, 0 },
+	{ 0, "15-15:N/N", &exp1[13 * step], 32, 0 },
+	{ 0, "15-N:1/N", &exp1[13 * step], 32, 0 },
+	{ 0, "16-N:16/N", &exp1[3 * step], 32, 0 },
+	{ 0, "N-N:N/N", &exp1[14 * step], 32, 0 },
 
-	{0, "0-N:1/3,1-N:1/3,2-N:1/3",		&exp1[8 * step], 32, 0},
-	{0, "0-31:1/3,1-31:1/3,2-31:1/3",	&exp1[8 * step], 32, 0},
-	{0, "1-10:8/12,8-31:24/29,0-31:0/3",	&exp1[9 * step], 32, 0},
+	{ 0, "0-N:1/3,1-N:1/3,2-N:1/3", &exp1[8 * step], 32, 0 },
+	{ 0, "0-31:1/3,1-31:1/3,2-31:1/3", &exp1[8 * step], 32, 0 },
+	{ 0, "1-10:8/12,8-31:24/29,0-31:0/3", &exp1[9 * step], 32, 0 },
 
-	{0,	  "all",		&exp1[8 * step], 32, 0},
-	{0,	  "0, 1, all,  ",	&exp1[8 * step], 32, 0},
-	{0,	  "all:1/2",		&exp1[4 * step], 32, 0},
-	{0,	  "ALL:1/2",		&exp1[4 * step], 32, 0},
-	{-EINVAL, "al", NULL, 8, 0},
-	{-EINVAL, "alll", NULL, 8, 0},
+	{ 0, "all", &exp1[8 * step], 32, 0 },
+	{ 0, "0, 1, all,  ", &exp1[8 * step], 32, 0 },
+	{ 0, "all:1/2", &exp1[4 * step], 32, 0 },
+	{ 0, "ALL:1/2", &exp1[4 * step], 32, 0 },
+	{ -EINVAL, "al", NULL, 8, 0 },
+	{ -EINVAL, "alll", NULL, 8, 0 },
 
-	{-EINVAL, "-1",	NULL, 8, 0},
-	{-EINVAL, "-0",	NULL, 8, 0},
-	{-EINVAL, "10-1", NULL, 8, 0},
-	{-ERANGE, "8-8", NULL, 8, 0},
-	{-ERANGE, "0-31", NULL, 8, 0},
-	{-EINVAL, "0-31:", NULL, 32, 0},
-	{-EINVAL, "0-31:0", NULL, 32, 0},
-	{-EINVAL, "0-31:0/", NULL, 32, 0},
-	{-EINVAL, "0-31:0/0", NULL, 32, 0},
-	{-EINVAL, "0-31:1/0", NULL, 32, 0},
-	{-EINVAL, "0-31:10/1", NULL, 32, 0},
-	{-EOVERFLOW, "0-98765432123456789:10/1", NULL, 8, 0},
+	{ -EINVAL, "-1", NULL, 8, 0 },
+	{ -EINVAL, "-0", NULL, 8, 0 },
+	{ -EINVAL, "10-1", NULL, 8, 0 },
+	{ -ERANGE, "8-8", NULL, 8, 0 },
+	{ -ERANGE, "0-31", NULL, 8, 0 },
+	{ -EINVAL, "0-31:", NULL, 32, 0 },
+	{ -EINVAL, "0-31:0", NULL, 32, 0 },
+	{ -EINVAL, "0-31:0/", NULL, 32, 0 },
+	{ -EINVAL, "0-31:0/0", NULL, 32, 0 },
+	{ -EINVAL, "0-31:1/0", NULL, 32, 0 },
+	{ -EINVAL, "0-31:10/1", NULL, 32, 0 },
+	{ -EOVERFLOW, "0-98765432123456789:10/1", NULL, 8, 0 },
 
-	{-EINVAL, "a-31", NULL, 8, 0},
-	{-EINVAL, "0-a1", NULL, 8, 0},
-	{-EINVAL, "a-31:10/1", NULL, 8, 0},
-	{-EINVAL, "0-31:a/1", NULL, 8, 0},
-	{-EINVAL, "0-\n", NULL, 8, 0},
+	{ -EINVAL, "a-31", NULL, 8, 0 },
+	{ -EINVAL, "0-a1", NULL, 8, 0 },
+	{ -EINVAL, "a-31:10/1", NULL, 8, 0 },
+	{ -EINVAL, "0-31:a/1", NULL, 8, 0 },
+	{ -EINVAL, "0-\n", NULL, 8, 0 },
 
 };
 
-static void __init test_bitmap_parselist(void)
+static void test_bitmap_parselist(void)
 {
 	int i;
 	int err;
@@ -546,29 +478,27 @@ static void __init test_bitmap_parselist(void)
 		time = ktime_get() - time;
 
 		if (err != ptest.errno) {
-			pr_err("parselist: %d: input is %s, errno is %d, expected %d\n",
-					i, ptest.in, err, ptest.errno);
-			failed_tests++;
+			tc_err("parselist: %d: input is %s, errno is %d, expected %d",
+			       i, ptest.in, err, ptest.errno);
 			continue;
 		}
 
-		if (!err && ptest.expected
-			 && !__bitmap_equal(bmap, ptest.expected, ptest.nbits)) {
-			pr_err("parselist: %d: input is %s, result is 0x%lx, expected 0x%lx\n",
-					i, ptest.in, bmap[0],
-					*ptest.expected);
-			failed_tests++;
+		if (!err && ptest.expected &&
+		    !__bitmap_equal(bmap, ptest.expected, ptest.nbits)) {
+			tc_err("parselist: %d: input is %s, result is 0x%lx, expected 0x%lx",
+			       i, ptest.in, bmap[0], *ptest.expected);
 			continue;
 		}
 
 		if (ptest.flags & PARSE_TIME)
-			pr_info("parselist('%s'):\t%llu\n", ptest.in, time);
+			kunit_info(kunittest, "parselist('%s'):\t%llu",
+				   ptest.in, time);
 
 #undef ptest
 	}
 }
 
-static void __init test_bitmap_printlist(void)
+static void test_bitmap_printlist(void)
 {
 	unsigned long *bmap = kmalloc(PAGE_SIZE, GFP_KERNEL);
 	char *buf = kmalloc(PAGE_SIZE, GFP_KERNEL);
@@ -589,64 +519,65 @@ static void __init test_bitmap_printlist(void)
 	time = ktime_get() - time;
 
 	if (ret != slen) {
-		pr_err("scnprintf(\"%%*pbl\"): result is %d, expected %d\n", ret, slen);
-		failed_tests++;
+		tc_err("scnprintf(\"%%*pbl\"): result is %d, expected %d", ret,
+		       slen);
 		goto out;
 	}
 
 	if (strncmp(buf, expected, slen)) {
-		pr_err("scnprintf(\"%%*pbl\"): result is %s, expected %s\n", buf, expected);
-		failed_tests++;
+		tc_err("scnprintf(\"%%*pbl\"): result is %s, expected %s", buf,
+		       expected);
 		goto out;
 	}
 
-	pr_info("scnprintf(\"%%*pbl\", '%s'):\t%llu\n", buf, time);
+	kunit_info(kunittest, "scnprintf(\"%%*pbl\", '%s'):\t%llu", buf, time);
 out:
 	kfree(buf);
 	kfree(bmap);
 }
 
-static const unsigned long parse_test[] __initconst = {
+static const unsigned long parse_test[] = {
 	BITMAP_FROM_U64(0),
 	BITMAP_FROM_U64(1),
 	BITMAP_FROM_U64(0xdeadbeef),
 	BITMAP_FROM_U64(0x100000000ULL),
 };
 
-static const unsigned long parse_test2[] __initconst = {
+static const unsigned long parse_test2[] = {
 	BITMAP_FROM_U64(0x100000000ULL), BITMAP_FROM_U64(0xdeadbeef),
 	BITMAP_FROM_U64(0x100000000ULL), BITMAP_FROM_U64(0xbaadf00ddeadbeef),
 	BITMAP_FROM_U64(0x100000000ULL), BITMAP_FROM_U64(0x0badf00ddeadbeef),
 };
 
-static const struct test_bitmap_parselist parse_tests[] __initconst = {
-	{0, "",				&parse_test[0 * step], 32, 0},
-	{0, " ",			&parse_test[0 * step], 32, 0},
-	{0, "0",			&parse_test[0 * step], 32, 0},
-	{0, "0\n",			&parse_test[0 * step], 32, 0},
-	{0, "1",			&parse_test[1 * step], 32, 0},
-	{0, "deadbeef",			&parse_test[2 * step], 32, 0},
-	{0, "1,0",			&parse_test[3 * step], 33, 0},
-	{0, "deadbeef,\n,0,1",		&parse_test[2 * step], 96, 0},
+static const struct test_bitmap_parselist parse_tests[] = {
+	{ 0, "", &parse_test[0 * step], 32, 0 },
+	{ 0, " ", &parse_test[0 * step], 32, 0 },
+	{ 0, "0", &parse_test[0 * step], 32, 0 },
+	{ 0, "0\n", &parse_test[0 * step], 32, 0 },
+	{ 0, "1", &parse_test[1 * step], 32, 0 },
+	{ 0, "deadbeef", &parse_test[2 * step], 32, 0 },
+	{ 0, "1,0", &parse_test[3 * step], 33, 0 },
+	{ 0, "deadbeef,\n,0,1", &parse_test[2 * step], 96, 0 },
 
-	{0, "deadbeef,1,0",		&parse_test2[0 * 2 * step], 96, 0},
-	{0, "baadf00d,deadbeef,1,0",	&parse_test2[1 * 2 * step], 128, 0},
-	{0, "badf00d,deadbeef,1,0",	&parse_test2[2 * 2 * step], 124, 0},
-	{0, "badf00d,deadbeef,1,0",	&parse_test2[2 * 2 * step], 124, NO_LEN},
-	{0, "  badf00d,deadbeef,1,0  ",	&parse_test2[2 * 2 * step], 124, 0},
-	{0, " , badf00d,deadbeef,1,0 , ",	&parse_test2[2 * 2 * step], 124, 0},
-	{0, " , badf00d, ,, ,,deadbeef,1,0 , ",	&parse_test2[2 * 2 * step], 124, 0},
+	{ 0, "deadbeef,1,0", &parse_test2[0 * 2 * step], 96, 0 },
+	{ 0, "baadf00d,deadbeef,1,0", &parse_test2[1 * 2 * step], 128, 0 },
+	{ 0, "badf00d,deadbeef,1,0", &parse_test2[2 * 2 * step], 124, 0 },
+	{ 0, "badf00d,deadbeef,1,0", &parse_test2[2 * 2 * step], 124, NO_LEN },
+	{ 0, "  badf00d,deadbeef,1,0  ", &parse_test2[2 * 2 * step], 124, 0 },
+	{ 0, " , badf00d,deadbeef,1,0 , ", &parse_test2[2 * 2 * step], 124, 0 },
+	{ 0, " , badf00d, ,, ,,deadbeef,1,0 , ", &parse_test2[2 * 2 * step],
+	  124, 0 },
 
-	{-EINVAL,    "goodfood,deadbeef,1,0",	NULL, 128, 0},
-	{-EOVERFLOW, "3,0",			NULL, 33, 0},
-	{-EOVERFLOW, "123badf00d,deadbeef,1,0",	NULL, 128, 0},
-	{-EOVERFLOW, "badf00d,deadbeef,1,0",	NULL, 90, 0},
-	{-EOVERFLOW, "fbadf00d,deadbeef,1,0",	NULL, 95, 0},
-	{-EOVERFLOW, "badf00d,deadbeef,1,0",	NULL, 100, 0},
+	{ -EINVAL, "goodfood,deadbeef,1,0", NULL, 128, 0 },
+	{ -EOVERFLOW, "3,0", NULL, 33, 0 },
+	{ -EOVERFLOW, "123badf00d,deadbeef,1,0", NULL, 128, 0 },
+	{ -EOVERFLOW, "badf00d,deadbeef,1,0", NULL, 90, 0 },
+	{ -EOVERFLOW, "fbadf00d,deadbeef,1,0", NULL, 95, 0 },
+	{ -EOVERFLOW, "badf00d,deadbeef,1,0", NULL, 100, 0 },
 #undef step
 };
 
-static void __init test_bitmap_parse(void)
+static void test_bitmap_parse(void)
 {
 	int i;
 	int err;
@@ -662,28 +593,26 @@ static void __init test_bitmap_parse(void)
 		time = ktime_get() - time;
 
 		if (err != test.errno) {
-			pr_err("parse: %d: input is %s, errno is %d, expected %d\n",
-					i, test.in, err, test.errno);
-			failed_tests++;
+			tc_err("parse: %d: input is %s, errno is %d, expected %d",
+			       i, test.in, err, test.errno);
 			continue;
 		}
 
-		if (!err && test.expected
-			 && !__bitmap_equal(bmap, test.expected, test.nbits)) {
-			pr_err("parse: %d: input is %s, result is 0x%lx, expected 0x%lx\n",
-					i, test.in, bmap[0],
-					*test.expected);
-			failed_tests++;
+		if (!err && test.expected &&
+		    !__bitmap_equal(bmap, test.expected, test.nbits)) {
+			tc_err("parse: %d: input is %s, result is 0x%lx, expected 0x%lx",
+			       i, test.in, bmap[0], *test.expected);
 			continue;
 		}
 
 		if (test.flags & PARSE_TIME)
-			pr_info("parse: %d: input is '%s' OK, Time: %llu\n",
-					i, test.in, time);
+			kunit_info(kunittest,
+				   "parse: %d: input is '%s' OK, Time: %llu", i,
+				   test.in, time);
 	}
 }
 
-static void __init test_bitmap_arr32(void)
+static void test_bitmap_arr32(void)
 {
 	unsigned int nbits, next_bit;
 	u32 arr[EXP1_IN_BITS / 32];
@@ -696,22 +625,20 @@ static void __init test_bitmap_arr32(void)
 		bitmap_from_arr32(bmap2, arr, nbits);
 		expect_eq_bitmap(bmap2, exp1, nbits);
 
-		next_bit = find_next_bit(bmap2,
-				round_up(nbits, BITS_PER_LONG), nbits);
+		next_bit = find_next_bit(bmap2, round_up(nbits, BITS_PER_LONG),
+					 nbits);
 		if (next_bit < round_up(nbits, BITS_PER_LONG)) {
-			pr_err("bitmap_copy_arr32(nbits == %d:"
-				" tail is not safely cleared: %d\n",
-				nbits, next_bit);
-			failed_tests++;
+			tc_err("bitmap_copy_arr32(nbits == %d: tail is not safely cleared: %d",
+			       nbits, next_bit);
 		}
 
 		if (nbits < EXP1_IN_BITS - 32)
 			expect_eq_uint(arr[DIV_ROUND_UP(nbits, 32)],
-								0xa5a5a5a5);
+				       0xa5a5a5a5);
 	}
 }
 
-static void __init test_bitmap_arr64(void)
+static void test_bitmap_arr64(void)
 {
 	unsigned int nbits, next_bit;
 	u64 arr[EXP1_IN_BITS / 64];
@@ -725,27 +652,27 @@ static void __init test_bitmap_arr64(void)
 		bitmap_from_arr64(bmap2, arr, nbits);
 		expect_eq_bitmap(bmap2, exp1, nbits);
 
-		next_bit = find_next_bit(bmap2, round_up(nbits, BITS_PER_LONG), nbits);
+		next_bit = find_next_bit(bmap2, round_up(nbits, BITS_PER_LONG),
+					 nbits);
 		if (next_bit < round_up(nbits, BITS_PER_LONG)) {
-			pr_err("bitmap_copy_arr64(nbits == %d:"
-				" tail is not safely cleared: %d\n", nbits, next_bit);
-			failed_tests++;
+			tc_err("bitmap_copy_arr64(nbits == %d: tail is not safely cleared: %d",
+			       nbits, next_bit);
 		}
 
-		if ((nbits % 64) &&
-		    (arr[(nbits - 1) / 64] & ~GENMASK_ULL((nbits - 1) % 64, 0))) {
-			pr_err("bitmap_to_arr64(nbits == %d): tail is not safely cleared: 0x%016llx (must be 0x%016llx)\n",
+		if ((nbits % 64) && (arr[(nbits - 1) / 64] &
+				     ~GENMASK_ULL((nbits - 1) % 64, 0))) {
+			tc_err("bitmap_to_arr64(nbits == %d): tail is not safely cleared: 0x%016llx (must be 0x%016llx)",
 			       nbits, arr[(nbits - 1) / 64],
 			       GENMASK_ULL((nbits - 1) % 64, 0));
-			failed_tests++;
 		}
 
 		if (nbits < EXP1_IN_BITS - 64)
-			expect_eq_uint(arr[DIV_ROUND_UP(nbits, 64)], 0xa5a5a5a5);
+			expect_eq_uint(arr[DIV_ROUND_UP(nbits, 64)],
+				       0xa5a5a5a5);
 	}
 }
 
-static void noinline __init test_mem_optimisations(void)
+static noinline void test_mem_optimisations(void)
 {
 	DECLARE_BITMAP(bmap1, 1024);
 	DECLARE_BITMAP(bmap2, 1024);
@@ -759,41 +686,36 @@ static void noinline __init test_mem_optimisations(void)
 			bitmap_set(bmap1, start, nbits);
 			__bitmap_set(bmap2, start, nbits);
 			if (!bitmap_equal(bmap1, bmap2, 1024)) {
-				printk("set not equal %d %d\n", start, nbits);
-				failed_tests++;
+				tc_err("set not equal %d %d", start, nbits);
 			}
 			if (!__bitmap_equal(bmap1, bmap2, 1024)) {
-				printk("set not __equal %d %d\n", start, nbits);
-				failed_tests++;
+				tc_err("set not __equal %d %d", start, nbits);
 			}
 
 			bitmap_clear(bmap1, start, nbits);
 			__bitmap_clear(bmap2, start, nbits);
 			if (!bitmap_equal(bmap1, bmap2, 1024)) {
-				printk("clear not equal %d %d\n", start, nbits);
-				failed_tests++;
+				tc_err("clear not equal %d %d", start, nbits);
 			}
 			if (!__bitmap_equal(bmap1, bmap2, 1024)) {
-				printk("clear not __equal %d %d\n", start,
-									nbits);
-				failed_tests++;
+				tc_err("clear not __equal %d %d", start, nbits);
 			}
 		}
 	}
 }
 
-static const unsigned char clump_exp[] __initconst = {
-	0x01,	/* 1 bit set */
-	0x02,	/* non-edge 1 bit set */
-	0x00,	/* zero bits set */
-	0x38,	/* 3 bits set across 4-bit boundary */
-	0x38,	/* Repeated clump */
-	0x0F,	/* 4 bits set */
-	0xFF,	/* all bits set */
-	0x05,	/* non-adjacent 2 bits set */
+static const unsigned char clump_exp[] = {
+	0x01, /* 1 bit set */
+	0x02, /* non-edge 1 bit set */
+	0x00, /* zero bits set */
+	0x38, /* 3 bits set across 4-bit boundary */
+	0x38, /* Repeated clump */
+	0x0F, /* 4 bits set */
+	0xFF, /* all bits set */
+	0x05, /* non-adjacent 2 bits set */
 };
 
-static void __init test_for_each_set_clump8(void)
+static void test_for_each_set_clump8(void)
 {
 #define CLUMP_EXP_NUMBITS 64
 	DECLARE_BITMAP(bits, CLUMP_EXP_NUMBITS);
@@ -802,20 +724,20 @@ static void __init test_for_each_set_clump8(void)
 
 	/* set bitmap to test case */
 	bitmap_zero(bits, CLUMP_EXP_NUMBITS);
-	bitmap_set(bits, 0, 1);		/* 0x01 */
-	bitmap_set(bits, 9, 1);		/* 0x02 */
-	bitmap_set(bits, 27, 3);	/* 0x28 */
-	bitmap_set(bits, 35, 3);	/* 0x28 */
-	bitmap_set(bits, 40, 4);	/* 0x0F */
-	bitmap_set(bits, 48, 8);	/* 0xFF */
-	bitmap_set(bits, 56, 1);	/* 0x05 - part 1 */
-	bitmap_set(bits, 58, 1);	/* 0x05 - part 2 */
+	bitmap_set(bits, 0, 1); /* 0x01 */
+	bitmap_set(bits, 9, 1); /* 0x02 */
+	bitmap_set(bits, 27, 3); /* 0x28 */
+	bitmap_set(bits, 35, 3); /* 0x28 */
+	bitmap_set(bits, 40, 4); /* 0x0F */
+	bitmap_set(bits, 48, 8); /* 0xFF */
+	bitmap_set(bits, 56, 1); /* 0x05 - part 1 */
+	bitmap_set(bits, 58, 1); /* 0x05 - part 2 */
 
 	for_each_set_clump8(start, clump, bits, CLUMP_EXP_NUMBITS)
 		expect_eq_clump8(start, CLUMP_EXP_NUMBITS, clump_exp, &clump);
 }
 
-static void __init test_for_each_set_bit_wrap(void)
+static void test_for_each_set_bit_wrap(void)
 {
 	DECLARE_BITMAP(orig, 500);
 	DECLARE_BITMAP(copy, 500);
@@ -840,7 +762,7 @@ static void __init test_for_each_set_bit_wrap(void)
 	}
 }
 
-static void __init test_for_each_set_bit(void)
+static void test_for_each_set_bit(void)
 {
 	DECLARE_BITMAP(orig, 500);
 	DECLARE_BITMAP(copy, 500);
@@ -862,7 +784,7 @@ static void __init test_for_each_set_bit(void)
 	expect_eq_bitmap(orig, copy, 500);
 }
 
-static void __init test_for_each_set_bit_from(void)
+static void test_for_each_set_bit_from(void)
 {
 	DECLARE_BITMAP(orig, 500);
 	DECLARE_BITMAP(copy, 500);
@@ -892,7 +814,7 @@ static void __init test_for_each_set_bit_from(void)
 	}
 }
 
-static void __init test_bitmap_weight(void)
+static void test_bitmap_weight(void)
 {
 	unsigned int bit, w1, w2, w;
 	DECLARE_BITMAP(b, 30);
@@ -932,11 +854,11 @@ static void __init test_bitmap_weight(void)
 	expect_eq_uint(100, bitmap_weight(b1, 100));
 
 	/* Outline */
-	for (int i  = 1; i < 128; i++)
+	for (int i = 1; i < 128; i++)
 		expect_eq_uint(i, bitmap_weight(b1, i));
 }
 
-static void __init test_for_each_clear_bit(void)
+static void test_for_each_clear_bit(void)
 {
 	DECLARE_BITMAP(orig, 500);
 	DECLARE_BITMAP(copy, 500);
@@ -958,7 +880,7 @@ static void __init test_for_each_clear_bit(void)
 	expect_eq_bitmap(orig, copy, 500);
 }
 
-static void __init test_for_each_clear_bit_from(void)
+static void test_for_each_clear_bit_from(void)
 {
 	DECLARE_BITMAP(orig, 500);
 	DECLARE_BITMAP(copy, 500);
@@ -988,7 +910,7 @@ static void __init test_for_each_clear_bit_from(void)
 	}
 }
 
-static void __init test_for_each_set_bitrange(void)
+static void test_for_each_set_bitrange(void)
 {
 	DECLARE_BITMAP(orig, 500);
 	DECLARE_BITMAP(copy, 500);
@@ -1005,12 +927,12 @@ static void __init test_for_each_set_bitrange(void)
 	bitmap_set(orig, 100, 50);
 
 	for_each_set_bitrange(s, e, orig, 500)
-		bitmap_set(copy, s, e-s);
+		bitmap_set(copy, s, e - s);
 
 	expect_eq_bitmap(orig, copy, 500);
 }
 
-static void __init test_for_each_clear_bitrange(void)
+static void test_for_each_clear_bitrange(void)
 {
 	DECLARE_BITMAP(orig, 500);
 	DECLARE_BITMAP(copy, 500);
@@ -1027,12 +949,12 @@ static void __init test_for_each_clear_bitrange(void)
 	bitmap_clear(orig, 100, 50);
 
 	for_each_clear_bitrange(s, e, orig, 500)
-		bitmap_clear(copy, s, e-s);
+		bitmap_clear(copy, s, e - s);
 
 	expect_eq_bitmap(orig, copy, 500);
 }
 
-static void __init test_for_each_set_bitrange_from(void)
+static void test_for_each_set_bitrange_from(void)
 {
 	DECLARE_BITMAP(orig, 500);
 	DECLARE_BITMAP(copy, 500);
@@ -1062,7 +984,7 @@ static void __init test_for_each_set_bitrange_from(void)
 	}
 }
 
-static void __init test_for_each_clear_bitrange_from(void)
+static void test_for_each_clear_bitrange_from(void)
 {
 	DECLARE_BITMAP(orig, 500);
 	DECLARE_BITMAP(copy, 500);
@@ -1101,41 +1023,189 @@ struct test_bitmap_cut {
 };
 
 static struct test_bitmap_cut test_cut[] = {
-	{  0,  0,  8, { 0x0000000aUL, }, { 0x0000000aUL, }, },
-	{  0,  0, 32, { 0xdadadeadUL, }, { 0xdadadeadUL, }, },
-	{  0,  3,  8, { 0x000000aaUL, }, { 0x00000015UL, }, },
-	{  3,  3,  8, { 0x000000aaUL, }, { 0x00000012UL, }, },
-	{  0,  1, 32, { 0xa5a5a5a5UL, }, { 0x52d2d2d2UL, }, },
-	{  0,  8, 32, { 0xdeadc0deUL, }, { 0x00deadc0UL, }, },
-	{  1,  1, 32, { 0x5a5a5a5aUL, }, { 0x2d2d2d2cUL, }, },
-	{  0, 15, 32, { 0xa5a5a5a5UL, }, { 0x00014b4bUL, }, },
-	{  0, 16, 32, { 0xa5a5a5a5UL, }, { 0x0000a5a5UL, }, },
-	{ 15, 15, 32, { 0xa5a5a5a5UL, }, { 0x000125a5UL, }, },
-	{ 15, 16, 32, { 0xa5a5a5a5UL, }, { 0x0000a5a5UL, }, },
-	{ 16, 15, 32, { 0xa5a5a5a5UL, }, { 0x0001a5a5UL, }, },
-
-	{ BITS_PER_LONG, BITS_PER_LONG, BITS_PER_LONG,
-		{ 0xa5a5a5a5UL, 0xa5a5a5a5UL, },
-		{ 0xa5a5a5a5UL, 0xa5a5a5a5UL, },
+	{
+		0,
+		0,
+		8,
+		{
+			0x0000000aUL,
+		},
+		{
+			0x0000000aUL,
+		},
 	},
-	{ 1, BITS_PER_LONG - 1, BITS_PER_LONG,
-		{ 0xa5a5a5a5UL, 0xa5a5a5a5UL, },
-		{ 0x00000001UL, 0x00000001UL, },
+	{
+		0,
+		0,
+		32,
+		{
+			0xdadadeadUL,
+		},
+		{
+			0xdadadeadUL,
+		},
+	},
+	{
+		0,
+		3,
+		8,
+		{
+			0x000000aaUL,
+		},
+		{
+			0x00000015UL,
+		},
+	},
+	{
+		3,
+		3,
+		8,
+		{
+			0x000000aaUL,
+		},
+		{
+			0x00000012UL,
+		},
+	},
+	{
+		0,
+		1,
+		32,
+		{
+			0xa5a5a5a5UL,
+		},
+		{
+			0x52d2d2d2UL,
+		},
+	},
+	{
+		0,
+		8,
+		32,
+		{
+			0xdeadc0deUL,
+		},
+		{
+			0x00deadc0UL,
+		},
+	},
+	{
+		1,
+		1,
+		32,
+		{
+			0x5a5a5a5aUL,
+		},
+		{
+			0x2d2d2d2cUL,
+		},
+	},
+	{
+		0,
+		15,
+		32,
+		{
+			0xa5a5a5a5UL,
+		},
+		{
+			0x00014b4bUL,
+		},
+	},
+	{
+		0,
+		16,
+		32,
+		{
+			0xa5a5a5a5UL,
+		},
+		{
+			0x0000a5a5UL,
+		},
+	},
+	{
+		15,
+		15,
+		32,
+		{
+			0xa5a5a5a5UL,
+		},
+		{
+			0x000125a5UL,
+		},
+	},
+	{
+		15,
+		16,
+		32,
+		{
+			0xa5a5a5a5UL,
+		},
+		{
+			0x0000a5a5UL,
+		},
+	},
+	{
+		16,
+		15,
+		32,
+		{
+			0xa5a5a5a5UL,
+		},
+		{
+			0x0001a5a5UL,
+		},
 	},
 
-	{ 0, BITS_PER_LONG * 2, BITS_PER_LONG * 2 + 1,
+	{
+		BITS_PER_LONG,
+		BITS_PER_LONG,
+		BITS_PER_LONG,
+		{
+			0xa5a5a5a5UL,
+			0xa5a5a5a5UL,
+		},
+		{
+			0xa5a5a5a5UL,
+			0xa5a5a5a5UL,
+		},
+	},
+	{
+		1,
+		BITS_PER_LONG - 1,
+		BITS_PER_LONG,
+		{
+			0xa5a5a5a5UL,
+			0xa5a5a5a5UL,
+		},
+		{
+			0x00000001UL,
+			0x00000001UL,
+		},
+	},
+
+	{
+		0,
+		BITS_PER_LONG * 2,
+		BITS_PER_LONG * 2 + 1,
 		{ 0xa5a5a5a5UL, 0x00000001UL, 0x00000001UL, 0x00000001UL },
-		{ 0x00000001UL, },
+		{
+			0x00000001UL,
+		},
 	},
-	{ 16, BITS_PER_LONG * 2 + 1, BITS_PER_LONG * 2 + 1 + 16,
+	{
+		16,
+		BITS_PER_LONG * 2 + 1,
+		BITS_PER_LONG * 2 + 1 + 16,
 		{ 0x0000ffffUL, 0x5a5a5a5aUL, 0x5a5a5a5aUL, 0x5a5a5a5aUL },
-		{ 0x2d2dffffUL, },
+		{
+			0x2d2dffffUL,
+		},
 	},
 };
 
-static void __init test_bitmap_cut(void)
+static void test_bitmap_cut(void)
 {
-	unsigned long b[5], *in = &b[1], *out = &b[0];	/* Partial overlap */
+	unsigned long b[5], *in = &b[1], *out = &b[0]; /* Partial overlap */
 	int i;
 
 	for (i = 0; i < ARRAY_SIZE(test_cut); i++) {
@@ -1156,58 +1226,79 @@ struct test_bitmap_print {
 	const char *list;
 };
 
-static const unsigned long small_bitmap[] __initconst = {
+static const unsigned long small_bitmap[] = {
 	BITMAP_FROM_U64(0x3333333311111111ULL),
 };
 
-static const char small_mask[] __initconst = "33333333,11111111\n";
-static const char small_list[] __initconst = "0,4,8,12,16,20,24,28,32-33,36-37,40-41,44-45,48-49,52-53,56-57,60-61\n";
+static const char small_mask[] = "33333333,11111111\n";
+static const char small_list[] =
+	"0,4,8,12,16,20,24,28,32-33,36-37,40-41,44-45,48-49,52-53,56-57,60-61\n";
 
-static const unsigned long large_bitmap[] __initconst = {
-	BITMAP_FROM_U64(0x3333333311111111ULL), BITMAP_FROM_U64(0x3333333311111111ULL),
-	BITMAP_FROM_U64(0x3333333311111111ULL), BITMAP_FROM_U64(0x3333333311111111ULL),
-	BITMAP_FROM_U64(0x3333333311111111ULL), BITMAP_FROM_U64(0x3333333311111111ULL),
-	BITMAP_FROM_U64(0x3333333311111111ULL), BITMAP_FROM_U64(0x3333333311111111ULL),
-	BITMAP_FROM_U64(0x3333333311111111ULL), BITMAP_FROM_U64(0x3333333311111111ULL),
-	BITMAP_FROM_U64(0x3333333311111111ULL), BITMAP_FROM_U64(0x3333333311111111ULL),
-	BITMAP_FROM_U64(0x3333333311111111ULL), BITMAP_FROM_U64(0x3333333311111111ULL),
-	BITMAP_FROM_U64(0x3333333311111111ULL), BITMAP_FROM_U64(0x3333333311111111ULL),
-	BITMAP_FROM_U64(0x3333333311111111ULL), BITMAP_FROM_U64(0x3333333311111111ULL),
-	BITMAP_FROM_U64(0x3333333311111111ULL), BITMAP_FROM_U64(0x3333333311111111ULL),
-	BITMAP_FROM_U64(0x3333333311111111ULL), BITMAP_FROM_U64(0x3333333311111111ULL),
-	BITMAP_FROM_U64(0x3333333311111111ULL), BITMAP_FROM_U64(0x3333333311111111ULL),
-	BITMAP_FROM_U64(0x3333333311111111ULL), BITMAP_FROM_U64(0x3333333311111111ULL),
-	BITMAP_FROM_U64(0x3333333311111111ULL), BITMAP_FROM_U64(0x3333333311111111ULL),
-	BITMAP_FROM_U64(0x3333333311111111ULL), BITMAP_FROM_U64(0x3333333311111111ULL),
-	BITMAP_FROM_U64(0x3333333311111111ULL), BITMAP_FROM_U64(0x3333333311111111ULL),
-	BITMAP_FROM_U64(0x3333333311111111ULL), BITMAP_FROM_U64(0x3333333311111111ULL),
-	BITMAP_FROM_U64(0x3333333311111111ULL), BITMAP_FROM_U64(0x3333333311111111ULL),
-	BITMAP_FROM_U64(0x3333333311111111ULL), BITMAP_FROM_U64(0x3333333311111111ULL),
-	BITMAP_FROM_U64(0x3333333311111111ULL), BITMAP_FROM_U64(0x3333333311111111ULL),
+static const unsigned long large_bitmap[] = {
+	BITMAP_FROM_U64(0x3333333311111111ULL),
+	BITMAP_FROM_U64(0x3333333311111111ULL),
+	BITMAP_FROM_U64(0x3333333311111111ULL),
+	BITMAP_FROM_U64(0x3333333311111111ULL),
+	BITMAP_FROM_U64(0x3333333311111111ULL),
+	BITMAP_FROM_U64(0x3333333311111111ULL),
+	BITMAP_FROM_U64(0x3333333311111111ULL),
+	BITMAP_FROM_U64(0x3333333311111111ULL),
+	BITMAP_FROM_U64(0x3333333311111111ULL),
+	BITMAP_FROM_U64(0x3333333311111111ULL),
+	BITMAP_FROM_U64(0x3333333311111111ULL),
+	BITMAP_FROM_U64(0x3333333311111111ULL),
+	BITMAP_FROM_U64(0x3333333311111111ULL),
+	BITMAP_FROM_U64(0x3333333311111111ULL),
+	BITMAP_FROM_U64(0x3333333311111111ULL),
+	BITMAP_FROM_U64(0x3333333311111111ULL),
+	BITMAP_FROM_U64(0x3333333311111111ULL),
+	BITMAP_FROM_U64(0x3333333311111111ULL),
+	BITMAP_FROM_U64(0x3333333311111111ULL),
+	BITMAP_FROM_U64(0x3333333311111111ULL),
+	BITMAP_FROM_U64(0x3333333311111111ULL),
+	BITMAP_FROM_U64(0x3333333311111111ULL),
+	BITMAP_FROM_U64(0x3333333311111111ULL),
+	BITMAP_FROM_U64(0x3333333311111111ULL),
+	BITMAP_FROM_U64(0x3333333311111111ULL),
+	BITMAP_FROM_U64(0x3333333311111111ULL),
+	BITMAP_FROM_U64(0x3333333311111111ULL),
+	BITMAP_FROM_U64(0x3333333311111111ULL),
+	BITMAP_FROM_U64(0x3333333311111111ULL),
+	BITMAP_FROM_U64(0x3333333311111111ULL),
+	BITMAP_FROM_U64(0x3333333311111111ULL),
+	BITMAP_FROM_U64(0x3333333311111111ULL),
+	BITMAP_FROM_U64(0x3333333311111111ULL),
+	BITMAP_FROM_U64(0x3333333311111111ULL),
+	BITMAP_FROM_U64(0x3333333311111111ULL),
+	BITMAP_FROM_U64(0x3333333311111111ULL),
+	BITMAP_FROM_U64(0x3333333311111111ULL),
+	BITMAP_FROM_U64(0x3333333311111111ULL),
+	BITMAP_FROM_U64(0x3333333311111111ULL),
+	BITMAP_FROM_U64(0x3333333311111111ULL),
 };
 
-static const char large_mask[] __initconst = "33333333,11111111,33333333,11111111,"
-					"33333333,11111111,33333333,11111111,"
-					"33333333,11111111,33333333,11111111,"
-					"33333333,11111111,33333333,11111111,"
-					"33333333,11111111,33333333,11111111,"
-					"33333333,11111111,33333333,11111111,"
-					"33333333,11111111,33333333,11111111,"
-					"33333333,11111111,33333333,11111111,"
-					"33333333,11111111,33333333,11111111,"
-					"33333333,11111111,33333333,11111111,"
-					"33333333,11111111,33333333,11111111,"
-					"33333333,11111111,33333333,11111111,"
-					"33333333,11111111,33333333,11111111,"
-					"33333333,11111111,33333333,11111111,"
-					"33333333,11111111,33333333,11111111,"
-					"33333333,11111111,33333333,11111111,"
-					"33333333,11111111,33333333,11111111,"
-					"33333333,11111111,33333333,11111111,"
-					"33333333,11111111,33333333,11111111,"
-					"33333333,11111111,33333333,11111111\n";
+static const char large_mask[] = "33333333,11111111,33333333,11111111,"
+				 "33333333,11111111,33333333,11111111,"
+				 "33333333,11111111,33333333,11111111,"
+				 "33333333,11111111,33333333,11111111,"
+				 "33333333,11111111,33333333,11111111,"
+				 "33333333,11111111,33333333,11111111,"
+				 "33333333,11111111,33333333,11111111,"
+				 "33333333,11111111,33333333,11111111,"
+				 "33333333,11111111,33333333,11111111,"
+				 "33333333,11111111,33333333,11111111,"
+				 "33333333,11111111,33333333,11111111,"
+				 "33333333,11111111,33333333,11111111,"
+				 "33333333,11111111,33333333,11111111,"
+				 "33333333,11111111,33333333,11111111,"
+				 "33333333,11111111,33333333,11111111,"
+				 "33333333,11111111,33333333,11111111,"
+				 "33333333,11111111,33333333,11111111,"
+				 "33333333,11111111,33333333,11111111,"
+				 "33333333,11111111,33333333,11111111,"
+				 "33333333,11111111,33333333,11111111\n";
 
-static const char large_list[] __initconst = /* more than 4KB */
+static const char large_list[] = /* more than 4KB */
 	"0,4,8,12,16,20,24,28,32-33,36-37,40-41,44-45,48-49,52-53,56-57,60-61,64,68,72,76,80,84,88,92,96-97,100-101,104-1"
 	"05,108-109,112-113,116-117,120-121,124-125,128,132,136,140,144,148,152,156,160-161,164-165,168-169,172-173,176-1"
 	"77,180-181,184-185,188-189,192,196,200,204,208,212,216,220,224-225,228-229,232-233,236-237,240-241,244-245,248-2"
@@ -1249,12 +1340,14 @@ static const char large_list[] __initconst = /* more than 4KB */
 	"2489,2492-2493,2496,2500,2504,2508,2512,2516,2520,2524,2528-2529,2532-2533,2536-2537,2540-2541,2544-2545,2548-25"
 	"49,2552-2553,2556-2557\n";
 
-static const struct test_bitmap_print test_print[] __initconst = {
-	{ small_bitmap, sizeof(small_bitmap) * BITS_PER_BYTE, small_mask, small_list },
-	{ large_bitmap, sizeof(large_bitmap) * BITS_PER_BYTE, large_mask, large_list },
+static const struct test_bitmap_print test_print[] = {
+	{ small_bitmap, sizeof(small_bitmap) * BITS_PER_BYTE, small_mask,
+	  small_list },
+	{ large_bitmap, sizeof(large_bitmap) * BITS_PER_BYTE, large_mask,
+	  large_list },
 };
 
-static void __init test_bitmap_print_buf(void)
+static void test_bitmap_print_buf(void)
 {
 	int i;
 
@@ -1267,15 +1360,16 @@ static void __init test_bitmap_print_buf(void)
 		expect_eq_uint(strlen(t->mask) + 1, n);
 		expect_eq_str(t->mask, print_buf, n);
 
-		n = bitmap_print_list_to_buf(print_buf, t->bitmap, t->nbits,
-					     0, 2 * PAGE_SIZE);
+		n = bitmap_print_list_to_buf(print_buf, t->bitmap, t->nbits, 0,
+					     2 * PAGE_SIZE);
 		expect_eq_uint(strlen(t->list) + 1, n);
 		expect_eq_str(t->list, print_buf, n);
 
 		/* test by non-zero offset */
 		if (strlen(t->list) > PAGE_SIZE) {
-			n = bitmap_print_list_to_buf(print_buf, t->bitmap, t->nbits,
-						     PAGE_SIZE, PAGE_SIZE);
+			n = bitmap_print_list_to_buf(print_buf, t->bitmap,
+						     t->nbits, PAGE_SIZE,
+						     PAGE_SIZE);
 			expect_eq_uint(strlen(t->list) + 1 - PAGE_SIZE, n);
 			expect_eq_str(t->list + PAGE_SIZE, print_buf, n);
 		}
@@ -1286,7 +1380,8 @@ static void __init test_bitmap_print_buf(void)
  * FIXME: Clang breaks compile-time evaluations when KASAN and GCOV are enabled.
  * To workaround it, GCOV is force-disabled in Makefile for this configuration.
  */
-static void __init test_bitmap_const_eval(void)
+/* KASAN interferes with Clang folding the compile-time-only checks below. */
+static void __no_sanitize_address test_bitmap_const_eval(void)
 {
 	DECLARE_BITMAP(bitmap, BITS_PER_LONG);
 	unsigned long initvar = BIT(2);
@@ -1354,7 +1449,7 @@ static void __init test_bitmap_const_eval(void)
 /*
  * Helper function to test bitmap_write() overwriting the chosen byte pattern.
  */
-static void __init test_bitmap_write_helper(const char *pattern)
+static void test_bitmap_write_helper(const char *pattern)
 {
 	DECLARE_BITMAP(bitmap, TEST_BIT_LEN);
 	DECLARE_BITMAP(exp_bitmap, TEST_BIT_LEN);
@@ -1378,8 +1473,7 @@ static void __init test_bitmap_write_helper(const char *pattern)
 		for (bit = 0; bit <= 1; bit++) {
 			bitmap_write(bitmap, bit, i, 1);
 			__assign_bit(i, exp_bitmap, bit);
-			expect_eq_bitmap(exp_bitmap, bitmap,
-					 TEST_BIT_LEN);
+			expect_eq_bitmap(exp_bitmap, bitmap, TEST_BIT_LEN);
 		}
 	}
 
@@ -1392,8 +1486,8 @@ static void __init test_bitmap_write_helper(const char *pattern)
 	}
 
 	for (nbits = BITS_PER_LONG; nbits >= 1; nbits--) {
-		w = IS_ENABLED(CONFIG_64BIT) ? 0xdeadbeefdeadbeefUL
-					     : 0xdeadbeefUL;
+		w = IS_ENABLED(CONFIG_64BIT) ? 0xdeadbeefdeadbeefUL :
+					       0xdeadbeefUL;
 		w >>= (BITS_PER_LONG - nbits);
 		for (i = 0; i <= TEST_BIT_LEN - nbits; i++) {
 			bitmap_copy(bitmap, pat_bitmap, TEST_BIT_LEN);
@@ -1408,9 +1502,9 @@ static void __init test_bitmap_write_helper(const char *pattern)
 	}
 }
 
-static void __init test_bitmap_read_write(void)
+static void test_bitmap_read_write(void)
 {
-	unsigned char *pattern[3] = {"", "all:1/2", "all"};
+	unsigned char *pattern[3] = { "", "all:1/2", "all" };
 	DECLARE_BITMAP(bitmap, TEST_BIT_LEN);
 	unsigned long zero_bits = 0, bits_per_long = BITS_PER_LONG;
 	unsigned long val;
@@ -1463,9 +1557,9 @@ static void __init test_bitmap_read_write(void)
  * value. The pointers are not dereferenced. The return value is intentionally
  * ignored.
  */
-static void __init test_zero_nbits(void)
+static void test_zero_nbits(void)
 {
-	static volatile __always_used unsigned long ret __initdata;
+	static volatile __always_used unsigned long ret;
 
 	bitmap_clear(NULL, 0, 0);
 	bitmap_complement(NULL, NULL, 0);
@@ -1515,8 +1609,10 @@ static void __init test_zero_nbits(void)
 
 #undef TEST_BIT_LEN
 
-static void __init selftest(void)
+static void bitmap_test(struct kunit *test)
 {
+	kunittest = test;
+
 	test_zero_clear();
 	test_fill_set();
 	test_copy();
@@ -1550,7 +1646,15 @@ static void __init selftest(void)
 	test_bitmap_find_next_zero_area_off();
 }
 
-KSTM_MODULE_LOADERS(test_bitmap);
+static struct kunit_case bitmap_test_cases[] = { KUNIT_CASE(bitmap_test), {} };
+
+static struct kunit_suite bitmap_test_suite = {
+	.name = "bitmap",
+	.test_cases = bitmap_test_cases,
+};
+
+kunit_test_suite(bitmap_test_suite);
+
 MODULE_AUTHOR("david decotigny <david.decotigny@googlers.com>");
 MODULE_DESCRIPTION("Test cases for bitmap API");
 MODULE_LICENSE("GPL");

@@ -349,16 +349,16 @@ How to use
 ----------
 
 Here we show the typical steps to create a test module and tie it into
-kselftest.  We use kselftests for lib/ as an example.
+kselftest.  The example below adds a new "foo" test.
 
 1. Create the test module
 
 2. Create the test script that will run (load/unload) the module
-   e.g. ``tools/testing/selftests/lib/bitmap.sh``
+   e.g. ``tools/testing/selftests/foo/foo.sh``
 
-3. Add line to config file e.g. ``tools/testing/selftests/lib/config``
+3. Add line to config file e.g. ``tools/testing/selftests/foo/config``
 
-4. Add test script to makefile  e.g. ``tools/testing/selftests/lib/Makefile``
+4. Add test script to makefile  e.g. ``tools/testing/selftests/foo/Makefile``
 
 5. Verify it works:
 
@@ -369,7 +369,7 @@ kselftest.  We use kselftests for lib/ as an example.
    make kselftest-merge
    make modules
    sudo make modules_install
-   make TARGETS=lib kselftest
+   make TARGETS=foo kselftest
 
 Example Module
 --------------
