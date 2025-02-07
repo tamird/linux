@@ -17,10 +17,6 @@
 static char pbl_buffer[PAGE_SIZE];
 static char print_buf[PAGE_SIZE * 2];
 
-static struct kunit *kunittest;
-
-#define tc_err(fmt, ...) KUNIT_FAIL(kunittest, fmt, ##__VA_ARGS__)
-
 static const unsigned long exp1[] = {
 	BITMAP_FROM_U64(1),
 	BITMAP_FROM_U64(2),
@@ -83,17 +79,10 @@ static const unsigned long exp3_1_0[] = {
 		KUNIT_EXPECT_EQ(kunittest, *clump, exp);                     \
 	} while (0)
 
-#define expect_eq_str(exp_str, str, len)                             \
-	{                                                            \
-		if (strncmp(exp_str, str, len) != 0) {               \
-			tc_err("expected %s, got %s", exp_str, str); \
-		}                                                    \
-	}
-
 #define expect_eq_uint(x, y) \
 	expect_eq_ulong((unsigned int)(x), (unsigned int)(y))
 
-static void test_zero_clear(void)
+static void test_zero_clear(struct kunit *kunittest)
 {
 	DECLARE_BITMAP(bmap, 1024);
 
@@ -122,7 +111,7 @@ static void test_zero_clear(void)
 	expect_eq_pbl("", bmap, 1024);
 }
 
-static void test_find_nth_bit(void)
+static void test_find_nth_bit(struct kunit *kunittest)
 {
 	unsigned long b, bit, cnt = 0;
 	DECLARE_BITMAP(bmap, 64 * 3);
@@ -163,7 +152,7 @@ static void test_find_nth_bit(void)
 	}
 }
 
-static void test_bitmap_find_next_zero_area_off(void)
+static void test_bitmap_find_next_zero_area_off(struct kunit *kunittest)
 {
 	DECLARE_BITMAP(bmap, 192);
 
@@ -199,7 +188,7 @@ static void test_bitmap_find_next_zero_area_off(void)
 							    0) >= 192));
 }
 
-static void test_fill_set(void)
+static void test_fill_set(struct kunit *kunittest)
 {
 	DECLARE_BITMAP(bmap, 1024);
 
@@ -228,7 +217,7 @@ static void test_fill_set(void)
 	expect_eq_pbl("0-1023", bmap, 1024);
 }
 
-static void test_copy(void)
+static void test_copy(struct kunit *kunittest)
 {
 	DECLARE_BITMAP(bmap1, 1024);
 	DECLARE_BITMAP(bmap2, 1024);
@@ -267,7 +256,7 @@ static void test_copy(void)
 	expect_eq_pbl("0-108,128-1023", bmap2, 1024);
 }
 
-static void test_bitmap_region(void)
+static void test_bitmap_region(struct kunit *kunittest)
 {
 	int pos, order;
 
@@ -292,7 +281,7 @@ static void test_bitmap_region(void)
 
 #define EXP2_IN_BITS (sizeof(exp2) * 8)
 
-static void test_replace(void)
+static void test_replace(struct kunit *kunittest)
 {
 	unsigned int nbits = 64;
 	unsigned int nlongs = DIV_ROUND_UP(nbits, BITS_PER_LONG);
@@ -341,7 +330,7 @@ static const unsigned long sg_scatter_exp[] = {
 	BITMAP_FROM_U64(0x0000000000000000ULL),
 };
 
-static void test_bitmap_sg(void)
+static void test_bitmap_sg(struct kunit *kunittest)
 {
 	unsigned int nbits = 64;
 	DECLARE_BITMAP(bmap_gather, 100);
@@ -377,6 +366,19 @@ struct test_bitmap_parselist {
 	const int nbits;
 	const int flags;
 };
+
+static void parselist_to_desc(const struct test_bitmap_parselist *param,
+			      char *desc)
+{
+	snprintf(desc, KUNIT_PARAM_DESC_SIZE,
+		 "nbits=%d,flags=0x%x,input=\"%*pE\"", param->nbits,
+		 param->flags, (int)strlen(param->in), param->in);
+}
+
+typedef int (*bitmap_parse_fn)(const struct test_bitmap_parselist *test,
+			       unsigned long *maskp);
+
+static void test_bitmap_parse_fn(struct kunit *kunittest, bitmap_parse_fn fn);
 
 static const struct test_bitmap_parselist parselist_tests[] = {
 #define step (sizeof(u64) / sizeof(unsigned long))
@@ -463,77 +465,65 @@ static const struct test_bitmap_parselist parselist_tests[] = {
 
 };
 
-static void test_bitmap_parselist(void)
+KUNIT_ARRAY_PARAM(test_parselist, parselist_tests, parselist_to_desc);
+
+static int do_bitmap_parselist(const struct test_bitmap_parselist *test,
+			       unsigned long *maskp)
 {
-	int i;
+	return bitmap_parselist(test->in, maskp, test->nbits);
+}
+
+static void test_bitmap_parselist(struct kunit *kunittest)
+{
+	test_bitmap_parse_fn(kunittest, do_bitmap_parselist);
+}
+
+static void test_bitmap_parse_fn(struct kunit *kunittest, bitmap_parse_fn fn)
+{
+	const struct test_bitmap_parselist *t = kunittest->param_value;
 	int err;
 	ktime_t time;
 	DECLARE_BITMAP(bmap, 2048);
 
-	for (i = 0; i < ARRAY_SIZE(parselist_tests); i++) {
-#define ptest parselist_tests[i]
+	time = ktime_get();
+	err = fn(t, bmap);
+	time = ktime_get() - time;
 
-		time = ktime_get();
-		err = bitmap_parselist(ptest.in, bmap, ptest.nbits);
-		time = ktime_get() - time;
+	KUNIT_ASSERT_EQ(kunittest, err, t->errno);
 
-		if (err != ptest.errno) {
-			tc_err("parselist: %d: input is %s, errno is %d, expected %d",
-			       i, ptest.in, err, ptest.errno);
-			continue;
-		}
+	if (!err && t->expected)
+		KUNIT_ASSERT_TRUE_MSG(kunittest,
+				      bitmap_equal(bmap, t->expected, t->nbits),
+				      "expected \"%*pbl\", got \"%*pbl\"",
+				      t->nbits, t->expected, t->nbits, bmap);
 
-		if (!err && ptest.expected &&
-		    !__bitmap_equal(bmap, ptest.expected, ptest.nbits)) {
-			tc_err("parselist: %d: input is %s, result is 0x%lx, expected 0x%lx",
-			       i, ptest.in, bmap[0], *ptest.expected);
-			continue;
-		}
-
-		if (ptest.flags & PARSE_TIME)
-			kunit_info(kunittest, "parselist('%s'):\t%llu",
-				   ptest.in, time);
-
-#undef ptest
-	}
+	if (t->flags & PARSE_TIME)
+		kunit_info(kunittest, "Time: %llu", time);
 }
 
-static void test_bitmap_printlist(void)
+static void test_bitmap_printlist(struct kunit *kunittest)
 {
-	unsigned long *bmap = kmalloc(PAGE_SIZE, GFP_KERNEL);
-	char *buf = kmalloc(PAGE_SIZE, GFP_KERNEL);
+	unsigned long *bmap = kunit_kmalloc(kunittest, PAGE_SIZE, GFP_KERNEL);
+	char *buf = kunit_kmalloc(kunittest, PAGE_SIZE, GFP_KERNEL);
 	char expected[256];
 	int ret, slen;
 	ktime_t time;
 
-	if (!buf || !bmap)
-		goto out;
+	KUNIT_ASSERT_NOT_NULL(kunittest, bmap);
+	KUNIT_ASSERT_NOT_NULL(kunittest, buf);
 
 	memset(bmap, -1, PAGE_SIZE);
-	slen = snprintf(expected, 256, "0-%ld", PAGE_SIZE * 8 - 1);
-	if (slen < 0)
-		goto out;
+	slen = snprintf(expected, sizeof(expected), "0-%ld", PAGE_SIZE * 8 - 1);
+	KUNIT_ASSERT_GT(kunittest, slen, 0);
 
 	time = ktime_get();
 	ret = scnprintf(buf, PAGE_SIZE, "%*pbl", (int)PAGE_SIZE * 8, bmap);
 	time = ktime_get() - time;
 
-	if (ret != slen) {
-		tc_err("scnprintf(\"%%*pbl\"): result is %d, expected %d", ret,
-		       slen);
-		goto out;
-	}
+	KUNIT_ASSERT_EQ(kunittest, ret, slen);
+	KUNIT_ASSERT_STREQ(kunittest, buf, expected);
 
-	if (strncmp(buf, expected, slen)) {
-		tc_err("scnprintf(\"%%*pbl\"): result is %s, expected %s", buf,
-		       expected);
-		goto out;
-	}
-
-	kunit_info(kunittest, "scnprintf(\"%%*pbl\", '%s'):\t%llu", buf, time);
-out:
-	kfree(buf);
-	kfree(bmap);
+	kunit_info(kunittest, "Time: %llu", time);
 }
 
 static const unsigned long parse_test[] = {
@@ -577,42 +567,22 @@ static const struct test_bitmap_parselist parse_tests[] = {
 #undef step
 };
 
-static void test_bitmap_parse(void)
+KUNIT_ARRAY_PARAM(test_parse, parse_tests, parselist_to_desc);
+
+static int do_bitmap_parse(const struct test_bitmap_parselist *test,
+			   unsigned long *maskp)
 {
-	int i;
-	int err;
-	ktime_t time;
-	DECLARE_BITMAP(bmap, 2048);
+	const size_t len = test->flags & NO_LEN ? UINT_MAX : strlen(test->in);
 
-	for (i = 0; i < ARRAY_SIZE(parse_tests); i++) {
-		struct test_bitmap_parselist test = parse_tests[i];
-		size_t len = test.flags & NO_LEN ? UINT_MAX : strlen(test.in);
-
-		time = ktime_get();
-		err = bitmap_parse(test.in, len, bmap, test.nbits);
-		time = ktime_get() - time;
-
-		if (err != test.errno) {
-			tc_err("parse: %d: input is %s, errno is %d, expected %d",
-			       i, test.in, err, test.errno);
-			continue;
-		}
-
-		if (!err && test.expected &&
-		    !__bitmap_equal(bmap, test.expected, test.nbits)) {
-			tc_err("parse: %d: input is %s, result is 0x%lx, expected 0x%lx",
-			       i, test.in, bmap[0], *test.expected);
-			continue;
-		}
-
-		if (test.flags & PARSE_TIME)
-			kunit_info(kunittest,
-				   "parse: %d: input is '%s' OK, Time: %llu", i,
-				   test.in, time);
-	}
+	return bitmap_parse(test->in, len, maskp, test->nbits);
 }
 
-static void test_bitmap_arr32(void)
+static void test_bitmap_parse(struct kunit *kunittest)
+{
+	test_bitmap_parse_fn(kunittest, do_bitmap_parse);
+}
+
+static void test_bitmap_arr32(struct kunit *kunittest)
 {
 	unsigned int nbits, next_bit;
 	u32 arr[EXP1_IN_BITS / 32];
@@ -628,8 +598,10 @@ static void test_bitmap_arr32(void)
 		next_bit = find_next_bit(bmap2, round_up(nbits, BITS_PER_LONG),
 					 nbits);
 		if (next_bit < round_up(nbits, BITS_PER_LONG)) {
-			tc_err("bitmap_copy_arr32(nbits == %d: tail is not safely cleared: %d",
-			       nbits, next_bit);
+			KUNIT_FAIL(
+				kunittest,
+				"bitmap_copy_arr32(nbits == %d: tail is not safely cleared: %d",
+				nbits, next_bit);
 		}
 
 		if (nbits < EXP1_IN_BITS - 32)
@@ -638,7 +610,7 @@ static void test_bitmap_arr32(void)
 	}
 }
 
-static void test_bitmap_arr64(void)
+static void test_bitmap_arr64(struct kunit *kunittest)
 {
 	unsigned int nbits, next_bit;
 	u64 arr[EXP1_IN_BITS / 64];
@@ -655,15 +627,19 @@ static void test_bitmap_arr64(void)
 		next_bit = find_next_bit(bmap2, round_up(nbits, BITS_PER_LONG),
 					 nbits);
 		if (next_bit < round_up(nbits, BITS_PER_LONG)) {
-			tc_err("bitmap_copy_arr64(nbits == %d: tail is not safely cleared: %d",
-			       nbits, next_bit);
+			KUNIT_FAIL(
+				kunittest,
+				"bitmap_copy_arr64(nbits == %d: tail is not safely cleared: %d",
+				nbits, next_bit);
 		}
 
 		if ((nbits % 64) && (arr[(nbits - 1) / 64] &
 				     ~GENMASK_ULL((nbits - 1) % 64, 0))) {
-			tc_err("bitmap_to_arr64(nbits == %d): tail is not safely cleared: 0x%016llx (must be 0x%016llx)",
-			       nbits, arr[(nbits - 1) / 64],
-			       GENMASK_ULL((nbits - 1) % 64, 0));
+			KUNIT_FAIL(
+				kunittest,
+				"bitmap_to_arr64(nbits == %d): tail is not safely cleared: 0x%016llx (must be 0x%016llx)",
+				nbits, arr[(nbits - 1) / 64],
+				GENMASK_ULL((nbits - 1) % 64, 0));
 		}
 
 		if (nbits < EXP1_IN_BITS - 64)
@@ -672,7 +648,7 @@ static void test_bitmap_arr64(void)
 	}
 }
 
-static noinline void test_mem_optimisations(void)
+static noinline void test_mem_optimisations(struct kunit *kunittest)
 {
 	DECLARE_BITMAP(bmap1, 1024);
 	DECLARE_BITMAP(bmap2, 1024);
@@ -686,19 +662,23 @@ static noinline void test_mem_optimisations(void)
 			bitmap_set(bmap1, start, nbits);
 			__bitmap_set(bmap2, start, nbits);
 			if (!bitmap_equal(bmap1, bmap2, 1024)) {
-				tc_err("set not equal %d %d", start, nbits);
+				KUNIT_FAIL(kunittest, "set not equal %d %d",
+					   start, nbits);
 			}
 			if (!__bitmap_equal(bmap1, bmap2, 1024)) {
-				tc_err("set not __equal %d %d", start, nbits);
+				KUNIT_FAIL(kunittest, "set not __equal %d %d",
+					   start, nbits);
 			}
 
 			bitmap_clear(bmap1, start, nbits);
 			__bitmap_clear(bmap2, start, nbits);
 			if (!bitmap_equal(bmap1, bmap2, 1024)) {
-				tc_err("clear not equal %d %d", start, nbits);
+				KUNIT_FAIL(kunittest, "clear not equal %d %d",
+					   start, nbits);
 			}
 			if (!__bitmap_equal(bmap1, bmap2, 1024)) {
-				tc_err("clear not __equal %d %d", start, nbits);
+				KUNIT_FAIL(kunittest, "clear not __equal %d %d",
+					   start, nbits);
 			}
 		}
 	}
@@ -715,7 +695,7 @@ static const unsigned char clump_exp[] = {
 	0x05, /* non-adjacent 2 bits set */
 };
 
-static void test_for_each_set_clump8(void)
+static void test_for_each_set_clump8(struct kunit *kunittest)
 {
 #define CLUMP_EXP_NUMBITS 64
 	DECLARE_BITMAP(bits, CLUMP_EXP_NUMBITS);
@@ -737,7 +717,7 @@ static void test_for_each_set_clump8(void)
 		expect_eq_clump8(start, CLUMP_EXP_NUMBITS, clump_exp, &clump);
 }
 
-static void test_for_each_set_bit_wrap(void)
+static void test_for_each_set_bit_wrap(struct kunit *kunittest)
 {
 	DECLARE_BITMAP(orig, 500);
 	DECLARE_BITMAP(copy, 500);
@@ -762,7 +742,7 @@ static void test_for_each_set_bit_wrap(void)
 	}
 }
 
-static void test_for_each_set_bit(void)
+static void test_for_each_set_bit(struct kunit *kunittest)
 {
 	DECLARE_BITMAP(orig, 500);
 	DECLARE_BITMAP(copy, 500);
@@ -784,7 +764,7 @@ static void test_for_each_set_bit(void)
 	expect_eq_bitmap(orig, copy, 500);
 }
 
-static void test_for_each_set_bit_from(void)
+static void test_for_each_set_bit_from(struct kunit *kunittest)
 {
 	DECLARE_BITMAP(orig, 500);
 	DECLARE_BITMAP(copy, 500);
@@ -814,7 +794,7 @@ static void test_for_each_set_bit_from(void)
 	}
 }
 
-static void test_bitmap_weight(void)
+static void test_bitmap_weight(struct kunit *kunittest)
 {
 	unsigned int bit, w1, w2, w;
 	DECLARE_BITMAP(b, 30);
@@ -858,7 +838,7 @@ static void test_bitmap_weight(void)
 		expect_eq_uint(i, bitmap_weight(b1, i));
 }
 
-static void test_for_each_clear_bit(void)
+static void test_for_each_clear_bit(struct kunit *kunittest)
 {
 	DECLARE_BITMAP(orig, 500);
 	DECLARE_BITMAP(copy, 500);
@@ -880,7 +860,7 @@ static void test_for_each_clear_bit(void)
 	expect_eq_bitmap(orig, copy, 500);
 }
 
-static void test_for_each_clear_bit_from(void)
+static void test_for_each_clear_bit_from(struct kunit *kunittest)
 {
 	DECLARE_BITMAP(orig, 500);
 	DECLARE_BITMAP(copy, 500);
@@ -910,7 +890,7 @@ static void test_for_each_clear_bit_from(void)
 	}
 }
 
-static void test_for_each_set_bitrange(void)
+static void test_for_each_set_bitrange(struct kunit *kunittest)
 {
 	DECLARE_BITMAP(orig, 500);
 	DECLARE_BITMAP(copy, 500);
@@ -932,7 +912,7 @@ static void test_for_each_set_bitrange(void)
 	expect_eq_bitmap(orig, copy, 500);
 }
 
-static void test_for_each_clear_bitrange(void)
+static void test_for_each_clear_bitrange(struct kunit *kunittest)
 {
 	DECLARE_BITMAP(orig, 500);
 	DECLARE_BITMAP(copy, 500);
@@ -954,7 +934,7 @@ static void test_for_each_clear_bitrange(void)
 	expect_eq_bitmap(orig, copy, 500);
 }
 
-static void test_for_each_set_bitrange_from(void)
+static void test_for_each_set_bitrange_from(struct kunit *kunittest)
 {
 	DECLARE_BITMAP(orig, 500);
 	DECLARE_BITMAP(copy, 500);
@@ -984,7 +964,7 @@ static void test_for_each_set_bitrange_from(void)
 	}
 }
 
-static void test_for_each_clear_bitrange_from(void)
+static void test_for_each_clear_bitrange_from(struct kunit *kunittest)
 {
 	DECLARE_BITMAP(orig, 500);
 	DECLARE_BITMAP(copy, 500);
@@ -1203,20 +1183,25 @@ static struct test_bitmap_cut test_cut[] = {
 	},
 };
 
-static void test_bitmap_cut(void)
+static void cut_to_desc(struct test_bitmap_cut *param, char *desc)
 {
+	snprintf(desc, KUNIT_PARAM_DESC_SIZE,
+		 "case=%td,first=%u,cut=%u,nbits=%u", param - test_cut,
+		 param->first, param->cut, param->nbits);
+}
+
+KUNIT_ARRAY_PARAM(test_cut, test_cut, cut_to_desc);
+
+static void test_bitmap_cut(struct kunit *kunittest)
+{
+	const struct test_bitmap_cut *t = kunittest->param_value;
 	unsigned long b[5], *in = &b[1], *out = &b[0]; /* Partial overlap */
-	int i;
 
-	for (i = 0; i < ARRAY_SIZE(test_cut); i++) {
-		struct test_bitmap_cut *t = &test_cut[i];
+	memcpy(in, t->in, sizeof(t->in));
 
-		memcpy(in, t->in, sizeof(t->in));
+	bitmap_cut(out, in, t->first, t->cut, t->nbits);
 
-		bitmap_cut(out, in, t->first, t->cut, t->nbits);
-
-		expect_eq_bitmap(t->expected, out, t->nbits);
-	}
+	expect_eq_bitmap(t->expected, out, t->nbits);
 }
 
 struct test_bitmap_print {
@@ -1224,6 +1209,7 @@ struct test_bitmap_print {
 	unsigned long nbits;
 	const char *mask;
 	const char *list;
+	const char *name;
 };
 
 static const unsigned long small_bitmap[] = {
@@ -1342,37 +1328,34 @@ static const char large_list[] = /* more than 4KB */
 
 static const struct test_bitmap_print test_print[] = {
 	{ small_bitmap, sizeof(small_bitmap) * BITS_PER_BYTE, small_mask,
-	  small_list },
+	  small_list, "small" },
 	{ large_bitmap, sizeof(large_bitmap) * BITS_PER_BYTE, large_mask,
-	  large_list },
+	  large_list, "large" },
 };
 
-static void test_bitmap_print_buf(void)
+KUNIT_ARRAY_PARAM_DESC(test_print, test_print, name);
+
+static void test_bitmap_print_buf(struct kunit *kunittest)
 {
-	int i;
+	const struct test_bitmap_print *t = kunittest->param_value;
+	int n;
 
-	for (i = 0; i < ARRAY_SIZE(test_print); i++) {
-		const struct test_bitmap_print *t = &test_print[i];
-		int n;
+	n = bitmap_print_bitmask_to_buf(print_buf, t->bitmap, t->nbits, 0,
+					2 * PAGE_SIZE);
+	expect_eq_uint(strlen(t->mask) + 1, n);
+	KUNIT_EXPECT_STREQ(kunittest, t->mask, print_buf);
 
-		n = bitmap_print_bitmask_to_buf(print_buf, t->bitmap, t->nbits,
-						0, 2 * PAGE_SIZE);
-		expect_eq_uint(strlen(t->mask) + 1, n);
-		expect_eq_str(t->mask, print_buf, n);
+	n = bitmap_print_list_to_buf(print_buf, t->bitmap, t->nbits, 0,
+				     2 * PAGE_SIZE);
+	expect_eq_uint(strlen(t->list) + 1, n);
+	KUNIT_EXPECT_STREQ(kunittest, t->list, print_buf);
 
-		n = bitmap_print_list_to_buf(print_buf, t->bitmap, t->nbits, 0,
-					     2 * PAGE_SIZE);
-		expect_eq_uint(strlen(t->list) + 1, n);
-		expect_eq_str(t->list, print_buf, n);
-
-		/* test by non-zero offset */
-		if (strlen(t->list) > PAGE_SIZE) {
-			n = bitmap_print_list_to_buf(print_buf, t->bitmap,
-						     t->nbits, PAGE_SIZE,
-						     PAGE_SIZE);
-			expect_eq_uint(strlen(t->list) + 1 - PAGE_SIZE, n);
-			expect_eq_str(t->list + PAGE_SIZE, print_buf, n);
-		}
+	/* test by non-zero offset */
+	if (strlen(t->list) > PAGE_SIZE) {
+		n = bitmap_print_list_to_buf(print_buf, t->bitmap, t->nbits,
+					     PAGE_SIZE, PAGE_SIZE);
+		expect_eq_uint(strlen(t->list) + 1 - PAGE_SIZE, n);
+		KUNIT_EXPECT_STREQ(kunittest, t->list + PAGE_SIZE, print_buf);
 	}
 }
 
@@ -1381,7 +1364,7 @@ static void test_bitmap_print_buf(void)
  * To workaround it, GCOV is force-disabled in Makefile for this configuration.
  */
 /* KASAN interferes with Clang folding the compile-time-only checks below. */
-static void __no_sanitize_address test_bitmap_const_eval(void)
+static void __no_sanitize_address test_bitmap_const_eval(struct kunit *kunittest)
 {
 	DECLARE_BITMAP(bitmap, BITS_PER_LONG);
 	unsigned long initvar = BIT(2);
@@ -1446,11 +1429,19 @@ static void __no_sanitize_address test_bitmap_const_eval(void)
  */
 #define TEST_BIT_LEN (1000)
 
-/*
- * Helper function to test bitmap_write() overwriting the chosen byte pattern.
- */
-static void test_bitmap_write_helper(const char *pattern)
+static const char *const pattern[] = { "", "all:1/2", "all" };
+
+static void pattern_to_desc(const char *const *param, char *desc)
 {
+	snprintf(desc, KUNIT_PARAM_DESC_SIZE, "\"%s\"", *param);
+}
+
+KUNIT_ARRAY_PARAM(pattern, pattern, pattern_to_desc);
+
+static void test_bitmap_write_pattern(struct kunit *kunittest)
+{
+	const char *const *p = kunittest->param_value;
+	const char *pattern = *p;
 	DECLARE_BITMAP(bitmap, TEST_BIT_LEN);
 	DECLARE_BITMAP(exp_bitmap, TEST_BIT_LEN);
 	DECLARE_BITMAP(pat_bitmap, TEST_BIT_LEN);
@@ -1502,13 +1493,12 @@ static void test_bitmap_write_helper(const char *pattern)
 	}
 }
 
-static void test_bitmap_read_write(void)
+static void test_bitmap_read_write(struct kunit *kunittest)
 {
-	unsigned char *pattern[3] = { "", "all:1/2", "all" };
 	DECLARE_BITMAP(bitmap, TEST_BIT_LEN);
 	unsigned long zero_bits = 0, bits_per_long = BITS_PER_LONG;
 	unsigned long val;
-	int i, pi;
+	int i;
 
 	/*
 	 * Reading/writing zero bits should not crash the kernel.
@@ -1546,9 +1536,6 @@ static void test_bitmap_read_write(void)
 		val = bitmap_read(bitmap, i, 8);
 		expect_eq_ulong(0b10110101UL, val);
 	}
-
-	for (pi = 0; pi < ARRAY_SIZE(pattern); pi++)
-		test_bitmap_write_helper(pattern[pi]);
 }
 
 /*
@@ -1557,7 +1544,7 @@ static void test_bitmap_read_write(void)
  * value. The pointers are not dereferenced. The return value is intentionally
  * ignored.
  */
-static void test_zero_nbits(void)
+static void test_zero_nbits(struct kunit *kunittest)
 {
 	static volatile __always_used unsigned long ret;
 
@@ -1609,44 +1596,41 @@ static void test_zero_nbits(void)
 
 #undef TEST_BIT_LEN
 
-static void bitmap_test(struct kunit *test)
-{
-	kunittest = test;
+static struct kunit_case bitmap_test_cases[] = {
+	KUNIT_CASE(test_zero_clear),
+	KUNIT_CASE(test_fill_set),
+	KUNIT_CASE(test_copy),
+	KUNIT_CASE(test_bitmap_region),
+	KUNIT_CASE(test_replace),
+	KUNIT_CASE(test_bitmap_sg),
+	KUNIT_CASE(test_bitmap_arr32),
+	KUNIT_CASE(test_bitmap_arr64),
+	KUNIT_CASE_PARAM(test_bitmap_parse, test_parse_gen_params),
+	KUNIT_CASE_PARAM(test_bitmap_parselist, test_parselist_gen_params),
+	KUNIT_CASE(test_bitmap_printlist),
+	KUNIT_CASE(test_mem_optimisations),
+	KUNIT_CASE_PARAM(test_bitmap_cut, test_cut_gen_params),
+	KUNIT_CASE_PARAM(test_bitmap_print_buf, test_print_gen_params),
+	KUNIT_CASE(test_bitmap_const_eval),
+	KUNIT_CASE(test_bitmap_read_write),
+	KUNIT_CASE(test_bitmap_weight),
+	KUNIT_CASE(test_zero_nbits),
+	KUNIT_CASE_PARAM(test_bitmap_write_pattern, pattern_gen_params),
 
-	test_zero_clear();
-	test_fill_set();
-	test_copy();
-	test_bitmap_region();
-	test_replace();
-	test_bitmap_sg();
-	test_bitmap_arr32();
-	test_bitmap_arr64();
-	test_bitmap_parse();
-	test_bitmap_parselist();
-	test_bitmap_printlist();
-	test_mem_optimisations();
-	test_bitmap_cut();
-	test_bitmap_print_buf();
-	test_bitmap_const_eval();
-	test_bitmap_read_write();
-	test_bitmap_weight();
-	test_zero_nbits();
-
-	test_find_nth_bit();
-	test_for_each_set_bit();
-	test_for_each_set_bit_from();
-	test_for_each_clear_bit();
-	test_for_each_clear_bit_from();
-	test_for_each_set_bitrange();
-	test_for_each_clear_bitrange();
-	test_for_each_set_bitrange_from();
-	test_for_each_clear_bitrange_from();
-	test_for_each_set_clump8();
-	test_for_each_set_bit_wrap();
-	test_bitmap_find_next_zero_area_off();
-}
-
-static struct kunit_case bitmap_test_cases[] = { KUNIT_CASE(bitmap_test), {} };
+	KUNIT_CASE(test_find_nth_bit),
+	KUNIT_CASE(test_bitmap_find_next_zero_area_off),
+	KUNIT_CASE(test_for_each_set_bit),
+	KUNIT_CASE(test_for_each_set_bit_from),
+	KUNIT_CASE(test_for_each_clear_bit),
+	KUNIT_CASE(test_for_each_clear_bit_from),
+	KUNIT_CASE(test_for_each_set_bitrange),
+	KUNIT_CASE(test_for_each_clear_bitrange),
+	KUNIT_CASE(test_for_each_set_bitrange_from),
+	KUNIT_CASE(test_for_each_clear_bitrange_from),
+	KUNIT_CASE(test_for_each_set_clump8),
+	KUNIT_CASE(test_for_each_set_bit_wrap),
+	{}
+};
 
 static struct kunit_suite bitmap_test_suite = {
 	.name = "bitmap",
