@@ -166,13 +166,15 @@ def generate_crates(
             edition=sysroot_edition,
         )
 
+    core = append_sysroot_crate("core", deps=[])
+
     # NB: sysroot crates reexport items from one another so setting up our transitive dependencies
     # here is important for ensuring that rust-analyzer can resolve symbols. The sources of truth
     # for this dependency graph are `(sysroot_src / crate / "Cargo.toml" for crate in crates)`.
-    core = append_sysroot_crate("core", deps=[])
-    alloc = append_sysroot_crate("alloc", deps=[core])
-    std = append_sysroot_crate("std", deps=[alloc, core])
-    proc_macro = append_sysroot_crate("proc_macro", deps=[core, std])
+    host_core = append_sysroot_crate("core", deps=[], cfg=[])
+    host_alloc = append_sysroot_crate("alloc", deps=[host_core], cfg=[])
+    host_std = append_sysroot_crate("std", deps=[host_alloc, host_core], cfg=[])
+    host_proc_macro = append_sysroot_crate("proc_macro", deps=[host_core, host_std], cfg=[])
 
     compiler_builtins = append_crate(
         "compiler_builtins",
@@ -183,26 +185,26 @@ def generate_crates(
     proc_macro2 = append_crate(
         "proc_macro2",
         srctree / "rust" / "proc-macro2" / "lib.rs",
-        deps=[core, alloc, std, proc_macro],
+        deps=[host_core, host_alloc, host_std, host_proc_macro],
     )
 
     quote = append_crate(
         "quote",
         srctree / "rust" / "quote" / "lib.rs",
-        deps=[alloc, proc_macro, proc_macro2],
+        deps=[host_alloc, host_proc_macro, proc_macro2],
         edition="2018",
     )
 
     syn = append_crate(
         "syn",
         srctree / "rust" / "syn" / "lib.rs",
-        deps=[proc_macro, proc_macro2, quote],
+        deps=[host_proc_macro, proc_macro2, quote],
     )
 
     macros = append_proc_macro_crate(
         "macros",
         srctree / "rust" / "macros" / "lib.rs",
-        deps=[std, proc_macro, proc_macro2, quote, syn],
+        deps=[host_std, host_proc_macro, proc_macro2, quote, syn],
     )
 
     build_error = append_crate(
@@ -214,7 +216,7 @@ def generate_crates(
     pin_init_internal = append_proc_macro_crate(
         "pin_init_internal",
         srctree / "rust" / "pin-init" / "internal" / "src" / "lib.rs",
-        deps=[std, proc_macro],
+        deps=[host_std, host_proc_macro],
     )
 
     pin_init = append_crate(
