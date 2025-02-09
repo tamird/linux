@@ -67,18 +67,15 @@ def generate_crates(
             line = line.replace("\n", "")
             generated_cfg.append(line)
 
-    # Now fill the crates list -- dependencies need to come first.
-    #
-    # Avoid O(n^2) iterations by keeping a map of indexes.
+    # Now fill the crates list.
     crates: List[Crate] = []
-    crates_indexes: Dict[str, int] = {}
     crates_cfgs = args_crates_cfgs(cfgs)
 
     def build_crate(
         display_name: str,
         root_module: pathlib.Path,
         *,
-        deps: List[str],
+        deps: List[Dependency],
         cfg: Optional[List[str]],
         is_workspace_member: Optional[bool],
         edition: Optional[str],
@@ -93,7 +90,7 @@ def generate_crates(
             "display_name": display_name,
             "root_module": str(root_module),
             "is_workspace_member": is_workspace_member,
-            "deps": [{"crate": crates_indexes[dep], "name": dep} for dep in deps],
+            "deps": deps,
             "cfg": cfg,
             "edition": edition,
             "env": {
@@ -105,11 +102,11 @@ def generate_crates(
         display_name: str,
         root_module: pathlib.Path,
         *,
-        deps: List[str],
+        deps: List[Dependency],
         cfg: Optional[List[str]] = None,
         is_workspace_member: Optional[bool] = None,
         edition: Optional[str] = None,
-    ) -> None:
+    ) -> Dependency:
         crate = build_crate(
             display_name,
             root_module,
@@ -127,22 +124,23 @@ def generate_crates(
             "is_proc_macro": True,
             "proc_macro_dylib_path": str(objtree / "rust" / proc_macro_dylib_name),
         }
-        register_crate(proc_macro_crate)
+        return register_crate(proc_macro_crate)
 
-    def register_crate(crate: Crate) -> None:
-        crates_indexes[crate["display_name"]] = len(crates)
+    def register_crate(crate: Crate) -> Dependency:
+        index = len(crates)
         crates.append(crate)
+        return {"crate": index, "name": crate["display_name"]}
 
     def append_crate(
         display_name: str,
         root_module: pathlib.Path,
         *,
-        deps: List[str],
+        deps: List[Dependency],
         cfg: Optional[List[str]] = None,
         is_workspace_member: Optional[bool] = None,
         edition: Optional[str] = None,
-    ) -> None:
-        register_crate(
+    ) -> Dependency:
+        return register_crate(
             build_crate(
                 display_name,
                 root_module,
@@ -156,10 +154,10 @@ def generate_crates(
     def append_sysroot_crate(
         display_name: str,
         *,
-        deps: List[str],
+        deps: List[Dependency],
         cfg: Optional[List[str]] = None,
-    ) -> None:
-        append_crate(
+    ) -> Dependency:
+        return append_crate(
             display_name,
             sysroot_src / display_name / "src" / "lib.rs",
             deps=deps,
@@ -171,73 +169,73 @@ def generate_crates(
     # NB: sysroot crates reexport items from one another so setting up our transitive dependencies
     # here is important for ensuring that rust-analyzer can resolve symbols. The sources of truth
     # for this dependency graph are `(sysroot_src / crate / "Cargo.toml" for crate in crates)`.
-    append_sysroot_crate("core", deps=[])
-    append_sysroot_crate("alloc", deps=["core"])
-    append_sysroot_crate("std", deps=["alloc", "core"])
-    append_sysroot_crate("proc_macro", deps=["core", "std"])
+    core = append_sysroot_crate("core", deps=[])
+    alloc = append_sysroot_crate("alloc", deps=[core])
+    std = append_sysroot_crate("std", deps=[alloc, core])
+    proc_macro = append_sysroot_crate("proc_macro", deps=[core, std])
 
-    append_crate(
+    compiler_builtins = append_crate(
         "compiler_builtins",
         srctree / "rust" / "compiler_builtins.rs",
-        deps=["core"],
+        deps=[core],
     )
 
-    append_crate(
+    proc_macro2 = append_crate(
         "proc_macro2",
         srctree / "rust" / "proc-macro2" / "lib.rs",
-        deps=["core", "alloc", "std", "proc_macro"],
+        deps=[core, alloc, std, proc_macro],
     )
 
-    append_crate(
+    quote = append_crate(
         "quote",
         srctree / "rust" / "quote" / "lib.rs",
-        deps=["alloc", "proc_macro", "proc_macro2"],
+        deps=[alloc, proc_macro, proc_macro2],
         edition="2018",
     )
 
-    append_crate(
+    syn = append_crate(
         "syn",
         srctree / "rust" / "syn" / "lib.rs",
-        deps=["proc_macro", "proc_macro2", "quote"],
+        deps=[proc_macro, proc_macro2, quote],
     )
 
-    append_proc_macro_crate(
+    macros = append_proc_macro_crate(
         "macros",
         srctree / "rust" / "macros" / "lib.rs",
-        deps=["std", "proc_macro", "proc_macro2", "quote", "syn"],
+        deps=[std, proc_macro, proc_macro2, quote, syn],
     )
 
-    append_crate(
+    build_error = append_crate(
         "build_error",
         srctree / "rust" / "build_error.rs",
-        deps=["core", "compiler_builtins"],
+        deps=[core, compiler_builtins],
     )
 
-    append_proc_macro_crate(
+    pin_init_internal = append_proc_macro_crate(
         "pin_init_internal",
         srctree / "rust" / "pin-init" / "internal" / "src" / "lib.rs",
-        deps=["std", "proc_macro"],
+        deps=[std, proc_macro],
     )
 
-    append_crate(
+    pin_init = append_crate(
         "pin_init",
         srctree / "rust" / "pin-init" / "src" / "lib.rs",
-        deps=["core", "compiler_builtins", "pin_init_internal", "macros"],
+        deps=[core, compiler_builtins, pin_init_internal, macros],
     )
 
-    append_crate(
+    ffi = append_crate(
         "ffi",
         srctree / "rust" / "ffi.rs",
-        deps=["core", "compiler_builtins"],
+        deps=[core, compiler_builtins],
     )
 
     def append_crate_with_generated(
         display_name: str,
         *,
-        deps: List[str],
+        deps: List[Dependency],
         is_workspace_member: Optional[bool] = None,
         edition: Optional[str] = None,
-    ) -> None:
+    ) -> Dependency:
         crate = build_crate(
             display_name,
             srctree / "rust" / display_name / "lib.rs",
@@ -257,20 +255,20 @@ def generate_crates(
                 "exclude_dirs": [],
             },
         }
-        register_crate(crate_with_generated)
+        return register_crate(crate_with_generated)
 
-    append_crate_with_generated("bindings", deps=["core", "ffi", "pin_init"])
-    append_crate_with_generated("uapi", deps=["core", "ffi", "pin_init"])
-    append_crate_with_generated(
+    bindings = append_crate_with_generated("bindings", deps=[core, ffi, pin_init])
+    uapi = append_crate_with_generated("uapi", deps=[core, ffi, pin_init])
+    kernel = append_crate_with_generated(
         "kernel",
         deps=[
-            "core",
-            "macros",
-            "build_error",
-            "pin_init",
-            "ffi",
-            "bindings",
-            "uapi",
+            core,
+            macros,
+            build_error,
+            pin_init,
+            ffi,
+            bindings,
+            uapi,
         ],
     )
 
@@ -300,7 +298,7 @@ def generate_crates(
             append_crate(
                 name,
                 path,
-                deps=["core", "kernel"],
+                deps=[core, kernel],
                 cfg=generated_cfg,
             )
 
