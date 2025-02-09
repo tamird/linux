@@ -79,6 +79,7 @@ def generate_crates(
         *,
         deps: List[Dependency],
         cfg: List[str],
+        is_host: bool,
         is_workspace_member: bool,
         edition: Optional[str],
     ) -> Crate:
@@ -89,7 +90,7 @@ def generate_crates(
             "root_module": str(root_module),
             "is_workspace_member": is_workspace_member,
             "deps": deps,
-            "cfg": cfg + crates_cfgs.get(display_name, []),
+            "cfg": cfg + ([] if is_host else crates_cfgs.get(display_name, [])),
             "edition": edition,
             "env": {
                 "RUST_MODFILE": "This is only for rust-analyzer"
@@ -116,6 +117,7 @@ def generate_crates(
                 deps=deps,
                 cfg=cfg,
                 is_workspace_member=True,
+                is_host=False,
                 edition=edition,
             )
         )
@@ -133,6 +135,7 @@ def generate_crates(
             root_module,
             deps=deps,
             cfg=cfg,
+            is_host=False,
             is_workspace_member=True,
             edition=edition,
         )
@@ -152,6 +155,7 @@ def generate_crates(
         *,
         deps: List[Dependency],
         cfg: List[str] = [],
+        is_host: bool,
     ) -> Dependency:
         return register_crate(
             build_crate(
@@ -159,18 +163,21 @@ def generate_crates(
                 sysroot_src / display_name / "src" / "lib.rs",
                 deps=deps,
                 cfg=cfg,
+                is_host=is_host,
                 is_workspace_member=False,
                 edition=sysroot_edition,
             )
         )
 
+    core = append_sysroot_crate("core", deps=[], is_host=False)
+
     # NB: sysroot crates reexport items from one another so setting up our transitive dependencies
     # here is important for ensuring that rust-analyzer can resolve symbols. The sources of truth
     # for this dependency graph are `(sysroot_src / crate / "Cargo.toml" for crate in crates)`.
-    core = append_sysroot_crate("core", deps=[])
-    alloc = append_sysroot_crate("alloc", deps=[core])
-    std = append_sysroot_crate("std", deps=[alloc, core])
-    proc_macro = append_sysroot_crate("proc_macro", deps=[core, std])
+    host_core = append_sysroot_crate("core", deps=[], is_host=True)
+    host_alloc = append_sysroot_crate("alloc", deps=[host_core], is_host=True)
+    host_std = append_sysroot_crate("std", deps=[host_alloc, host_core], is_host=True)
+    host_proc_macro = append_sysroot_crate("proc_macro", deps=[host_core, host_std], is_host=True)
 
     compiler_builtins = append_crate(
         "compiler_builtins",
@@ -181,26 +188,26 @@ def generate_crates(
     proc_macro2 = append_crate(
         "proc_macro2",
         srctree / "rust" / "proc-macro2" / "lib.rs",
-        deps=[core, alloc, std, proc_macro],
+        deps=[host_core, host_alloc, host_std, host_proc_macro],
     )
 
     quote = append_crate(
         "quote",
         srctree / "rust" / "quote" / "lib.rs",
-        deps=[alloc, proc_macro, proc_macro2],
+        deps=[host_alloc, host_proc_macro, proc_macro2],
         edition="2018",
     )
 
     syn = append_crate(
         "syn",
         srctree / "rust" / "syn" / "lib.rs",
-        deps=[proc_macro, proc_macro2, quote],
+        deps=[host_proc_macro, proc_macro2, quote],
     )
 
     macros = append_proc_macro_crate(
         "macros",
         srctree / "rust" / "macros" / "lib.rs",
-        deps=[std, proc_macro, proc_macro2, quote, syn],
+        deps=[host_std, host_proc_macro, proc_macro2, quote, syn],
     )
 
     build_error = append_crate(
@@ -212,7 +219,7 @@ def generate_crates(
     pin_init_internal = append_proc_macro_crate(
         "pin_init_internal",
         srctree / "rust" / "pin-init" / "internal" / "src" / "lib.rs",
-        deps=[std, proc_macro],
+        deps=[host_std, host_proc_macro],
         cfg=["kernel"],
     )
 
@@ -240,6 +247,7 @@ def generate_crates(
             srctree / "rust" / display_name / "lib.rs",
             deps=deps,
             cfg=generated_cfg,
+            is_host=False,
             is_workspace_member=True,
             edition=edition,
         )
