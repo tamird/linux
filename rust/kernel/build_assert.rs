@@ -79,3 +79,16 @@ macro_rules! build_assert {
         }
     }};
 }
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn foo() {
+        #[inline(never)]
+        fn non_const_usize() -> usize {
+            let x = 0;
+            &x as *const _ as usize
+        }
+        build_assert!(non_const_usize() == 0); // Build-time check
+    }
+}
