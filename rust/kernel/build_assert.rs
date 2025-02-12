@@ -24,9 +24,6 @@ pub use build_error::build_error;
 /// ```
 #[macro_export]
 macro_rules! build_error {
-    () => {{
-        $crate::build_assert::build_error("")
-    }};
     ($msg:expr) => {{
         $crate::build_assert::build_error($msg)
     }};
@@ -73,14 +70,12 @@ macro_rules! build_error {
 /// [`static_assert!`]: crate::static_assert!
 #[macro_export]
 macro_rules! build_assert {
-    ($cond:expr $(,)?) => {{
-        if !$cond {
-            $crate::build_assert::build_error(concat!("assertion failed: ", stringify!($cond)));
-        }
+    ($cond:expr) => {{
+        $crate::build_assert!($cond, concat!("assertion failed: ", stringify!($cond)));
     }};
     ($cond:expr, $msg:expr) => {{
         if !$cond {
-            $crate::build_assert::build_error($msg);
+            $crate::build_error!($msg);
         }
     }};
 }
