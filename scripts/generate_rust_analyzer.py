@@ -157,7 +157,7 @@ def generate_crates(srctree, objtree, sysroot_src, external_src, cfgs, sysroot_e
         crates[-1]["source"] = {
             "include_dirs": [
                 str(srctree / "rust" / display_name),
-                str(objtree / "rust")
+                str(objtree / "rust"),
             ],
             "exclude_dirs": [],
         }
@@ -213,7 +213,7 @@ def main():
 
     logging.basicConfig(
         format="[%(asctime)s] [%(levelname)s] %(message)s",
-        level=logging.INFO if args.verbose else logging.WARNING
+        level=logging.INFO if args.verbose else logging.WARNING,
     )
 
     # Making sure that the `sysroot` and `sysroot_src` belong to the same toolchain.
