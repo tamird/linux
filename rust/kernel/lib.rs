@@ -40,6 +40,95 @@
 #![cfg_attr(not(CONFIG_RUSTC_HAS_COERCE_POINTEE), feature(coerce_unsized))]
 #![cfg_attr(not(CONFIG_RUSTC_HAS_COERCE_POINTEE), feature(dispatch_from_dyn))]
 #![cfg_attr(not(CONFIG_RUSTC_HAS_COERCE_POINTEE), feature(unsize))]
+//
+// Stable in Rust 1.84.0.
+#![feature(exposed_provenance)]
+#![feature(strict_provenance)]
+// Added in Rust 1.84.0.
+//
+#![cfg_attr(CONFIG_RUSTC_HAS_STABLE_PROVENANCE, feature(strict_provenance_lints))]
+#![deny(fuzzy_provenance_casts, lossy_provenance_casts)]
+
+/// Gets the "address" portion of the pointer.
+///
+/// See <https://doc.rust-lang.org/stable/core/primitive.pointer.html#method.addr>.
+#[cfg_attr(CONFIG_RUSTC_HAS_STABLE_PROVENANCE, expect(clippy::incompatible_msrv))]
+#[inline]
+pub fn addr<T>(ptr: *const T) -> usize {
+    ptr.addr()
+}
+
+/// Creates a pointer with the given address and no provenance.
+///
+/// See <https://doc.rust-lang.org/stable/core/ptr/fn.without_provenance_mut.html>.
+#[cfg_attr(CONFIG_RUSTC_HAS_STABLE_PROVENANCE, expect(clippy::incompatible_msrv))]
+#[inline]
+pub fn without_provenance_mut<T>(addr: usize) -> *mut T {
+    core::ptr::without_provenance_mut(addr)
+}
+
+#[cfg(CONFIG_RUSTC_HAS_EXPOSED_PROVENANCE)]
+#[cfg_attr(CONFIG_RUSTC_HAS_STABLE_PROVENANCE, expect(clippy::incompatible_msrv))]
+mod strict_provenance {
+    /// Exposes the "provenance" part of the pointer for future use in
+    /// [`with_exposed_provenance`] and returns the "address" portion.
+    ///
+    /// See <https://doc.rust-lang.org/stable/core/primitive.pointer.html#method.expose_provenance>.
+    #[inline]
+    pub fn expose_provenance<T>(ptr: *const T) -> usize {
+        ptr.expose_provenance()
+    }
+
+    /// Converts an address back to a pointer, picking up some previously 'exposed'
+    /// provenance.
+    ///
+    /// See <https://doc.rust-lang.org/stable/core/ptr/fn.with_exposed_provenance.html>.
+    #[inline]
+    pub fn with_exposed_provenance<T>(addr: usize) -> *const T {
+        core::ptr::with_exposed_provenance(addr)
+    }
+
+    /// Converts an address back to a mutable pointer, picking up some previously 'exposed'
+    /// provenance.
+    ///
+    /// See <https://doc.rust-lang.org/stable/core/ptr/fn.with_exposed_provenance_mut.html>.
+    #[inline]
+    pub fn with_exposed_provenance_mut<T>(addr: usize) -> *mut T {
+        core::ptr::with_exposed_provenance_mut(addr)
+    }
+}
+
+#[cfg(not(CONFIG_RUSTC_HAS_EXPOSED_PROVENANCE))]
+mod strict_provenance {
+    /// Exposes the "provenance" part of the pointer for future use in
+    /// [`with_exposed_provenance`] and returns the "address" portion.
+    ///
+    /// See <https://doc.rust-lang.org/stable/core/primitive.pointer.html#method.expose_provenance>.
+    #[inline]
+    pub fn expose_provenance<T>(ptr: *const T) -> usize {
+        ptr.expose_addr()
+    }
+
+    /// Converts an address back to a pointer, picking up some previously 'exposed'
+    /// provenance.
+    ///
+    /// See <https://doc.rust-lang.org/stable/core/ptr/fn.with_exposed_provenance.html>.
+    #[inline]
+    pub fn with_exposed_provenance<T>(addr: usize) -> *const T {
+        core::ptr::from_exposed_addr(addr)
+    }
+
+    /// Converts an address back to a mutable pointer, picking up some previously 'exposed'
+    /// provenance.
+    ///
+    /// See <https://doc.rust-lang.org/stable/core/ptr/fn.with_exposed_provenance_mut.htm>.
+    #[inline]
+    pub fn with_exposed_provenance_mut<T>(addr: usize) -> *mut T {
+        core::ptr::from_exposed_addr_mut(addr)
+    }
+}
+
+pub use strict_provenance::*;
 
 // Ensure conditional compilation based on the kernel configuration works;
 // otherwise we may silently break things like initcall handling.

@@ -142,6 +142,12 @@ config RUSTC_HAS_SPAN_FILE
 config RUSTC_HAS_UNNECESSARY_TRANSMUTES
 	def_bool RUSTC_VERSION >= 108800
 
+config RUSTC_HAS_EXPOSED_PROVENANCE
+	def_bool RUSTC_VERSION >= 107900
+
+config RUSTC_HAS_STABLE_PROVENANCE
+	def_bool RUSTC_VERSION >= 108400
+
 config PAHOLE_VERSION
 	int
 	default $(shell,$(srctree)/scripts/pahole-version.sh $(PAHOLE))
