@@ -11,6 +11,7 @@ import pathlib
 import subprocess
 import sys
 
+
 def args_crates_cfgs(cfgs):
     crates_cfgs = {}
     for cfg in cfgs:
@@ -18,6 +19,7 @@ def args_crates_cfgs(cfgs):
         crates_cfgs[crate] = vals.split()
 
     return crates_cfgs
+
 
 def generate_crates(srctree, objtree, sysroot_src, external_src, cfgs, sysroot_edition):
     # Generate the configuration list.
@@ -147,7 +149,7 @@ def generate_crates(srctree, objtree, sysroot_src, external_src, cfgs, sysroot_e
     ):
         append_crate(
             display_name,
-            srctree / "rust"/ display_name / "lib.rs",
+            srctree / "rust" / display_name / "lib.rs",
             deps,
             cfg=cfg,
         )
@@ -196,6 +198,7 @@ def generate_crates(srctree, objtree, sysroot_src, external_src, cfgs, sysroot_e
 
     return crates
 
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--verbose', '-v', action='store_true')
@@ -222,6 +225,7 @@ def main():
     }
 
     json.dump(rust_project, sys.stdout, sort_keys=True, indent=4)
+
 
 if __name__ == "__main__":
     main()
