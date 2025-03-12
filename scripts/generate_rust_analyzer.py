@@ -54,7 +54,7 @@ def generate_crates(srctree, objtree, sysroot_src, external_src, cfgs, sysroot_e
             proc_macro_dylib_name = subprocess.check_output(
                 [os.environ["RUSTC"], "--print", "file-names", "--crate-name", display_name, "--crate-type", "proc-macro", "-"],
                 stdin=subprocess.DEVNULL,
-            ).decode('utf-8').strip()
+            ).decode("utf-8").strip()
             crate["proc_macro_dylib_path"] = f"{objtree}/rust/{proc_macro_dylib_name}"
         crates_indexes[display_name] = len(crates)
         crates.append(crate)
@@ -201,8 +201,8 @@ def generate_crates(srctree, objtree, sysroot_src, external_src, cfgs, sysroot_e
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--verbose', '-v', action='store_true')
-    parser.add_argument('--cfgs', action='append', default=[])
+    parser.add_argument("--verbose", "-v", action="store_true")
+    parser.add_argument("--cfgs", action="append", default=[])
     parser.add_argument("sysroot_edition")
     parser.add_argument("srctree", type=pathlib.Path)
     parser.add_argument("objtree", type=pathlib.Path)
