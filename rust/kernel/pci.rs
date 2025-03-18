@@ -296,7 +296,7 @@ impl<const SIZE: usize> Bar<SIZE> {
         // `pdev` is valid by the invariants of `Device`.
         // `num` is checked for validity by a previous call to `Device::resource_len`.
         // `name` is always valid.
-        let ioptr = crate::expose_provenance(unsafe { bindings::pci_iomap(pdev.as_raw(), num, 0) });
+        let ioptr = unsafe { bindings::pci_iomap(pdev.as_raw(), num, 0) }.expose_provenance();
         if ioptr == 0 {
             // SAFETY:
             // `pdev` valid by the invariants of `Device`.

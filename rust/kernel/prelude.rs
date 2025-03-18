@@ -21,6 +21,8 @@ pub use ::ffi::{
 
 pub use crate::alloc::{flags::*, Box, KBox, KVBox, KVVec, KVec, VBox, VVec, Vec};
 
+pub use crate::ProvenancePtrExt as _;
+
 #[doc(no_inline)]
 pub use macros::{export, kunit_tests, module, vtable};
 

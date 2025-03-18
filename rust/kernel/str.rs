@@ -2,6 +2,7 @@
 
 //! String representations.
 
+use crate::ProvenancePtrExt as _;
 use crate::alloc::{flags::*, AllocError, KVec};
 use core::fmt::{self, Write};
 use core::ops::{self, Deref, DerefMut, Index};
@@ -728,9 +729,10 @@ impl RawFormatter {
     pub(crate) unsafe fn from_ptrs(pos: *mut u8, end: *mut u8) -> Self {
         // INVARIANT: The safety requirements guarantee the type invariants.
         Self {
-            beg: crate::expose_provenance(pos),
-            pos: crate::expose_provenance(pos),
-            end: crate::expose_provenance(end),
+
+            beg: pos.expose_provenance(),
+            pos: pos.expose_provenance(),
+            end: end.expose_provenance(),
         }
     }
 
@@ -741,7 +743,7 @@ impl RawFormatter {
     /// The memory region starting at `buf` and extending for `len` bytes must be valid for writes
     /// for the lifetime of the returned [`RawFormatter`].
     pub(crate) unsafe fn from_buffer(buf: *mut u8, len: usize) -> Self {
-        let pos = crate::expose_provenance(buf);
+        let pos = buf.expose_provenance();
         // INVARIANT: We ensure that `end` is never less than `buf`, and the safety requirements
         // guarantees that the memory region is valid for writes.
         Self {

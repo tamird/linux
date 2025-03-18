@@ -230,6 +230,8 @@ pub extern "C" fn {kunit_name}(__kunit_test: *mut ::kernel::bindings::kunit) {{
 
 const __LOG_PREFIX: &[u8] = b"rust_doctests_kernel\0";
 
+#![allow(clippy::incompatible_msrv, reason = "https://github.com/rust-lang/rust-clippy/issues/14425")]
+
 {rust_tests}
 "#
     )

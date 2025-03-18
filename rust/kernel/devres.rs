@@ -47,7 +47,7 @@ struct DevresInner<T> {
 /// # Examples
 ///
 /// ```no_run
-/// # use kernel::{bindings, c_str, device::{Bound, Device}, devres::Devres, io::{Io, IoRaw}};
+/// # use kernel::{bindings, c_str, device::{Bound, Device}, devres::Devres, io::{Io, IoRaw}, prelude::*};
 /// # use core::ops::Deref;
 ///
 /// // See also [`pci::Bar`] for a real example.
@@ -66,7 +66,7 @@ struct DevresInner<T> {
 ///             return Err(ENOMEM);
 ///         }
 ///
-///         Ok(IoMem(IoRaw::new(kernel::expose_provenance(addr), SIZE)?))
+///         Ok(IoMem(IoRaw::new(addr.expose_provenance(), SIZE)?))
 ///     }
 /// }
 ///
