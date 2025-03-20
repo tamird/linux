@@ -37,7 +37,15 @@ def generate_crates(srctree, objtree, sysroot_src, external_src, cfgs, sysroot_e
     crates_indexes = {}
     crates_cfgs = args_crates_cfgs(cfgs)
 
-    def append_crate(display_name, root_module, deps, cfg=[], is_workspace_member=True, is_proc_macro=False, edition="2021"):
+    def build_crate(display_name, root_module, deps, cfg=None, is_workspace_member=None, is_proc_macro=None, edition=None):
+        if cfg is None:
+            cfg = []
+        if is_workspace_member is None:
+            is_workspace_member = True
+        if is_proc_macro is None:
+            is_proc_macro = False
+        if edition is None:
+            edition = "2021"
         crate = {
             "display_name": display_name,
             "root_module": str(root_module),
@@ -56,8 +64,14 @@ def generate_crates(srctree, objtree, sysroot_src, external_src, cfgs, sysroot_e
                 stdin=subprocess.DEVNULL,
             ).decode("utf-8").strip()
             crate["proc_macro_dylib_path"] = f"{objtree}/rust/{proc_macro_dylib_name}"
-        crates_indexes[display_name] = len(crates)
+        return crate
+
+    def register_crate(crate):
+        crates_indexes[crate["display_name"]] = len(crates)
         crates.append(crate)
+
+    def append_crate(display_name, root_module, deps, cfg=None, is_workspace_member=None, is_proc_macro=None, edition=None):
+        register_crate(build_crate(display_name, root_module, deps, cfg, is_workspace_member, is_proc_macro, edition))
 
     def append_sysroot_crate(
         display_name,
@@ -147,20 +161,21 @@ def generate_crates(srctree, objtree, sysroot_src, external_src, cfgs, sysroot_e
         display_name,
         deps,
     ):
-        append_crate(
+        crate = build_crate(
             display_name,
             srctree / "rust" / display_name / "lib.rs",
             deps,
             cfg=cfg,
         )
-        crates[-1]["env"]["OBJTREE"] = str(objtree.resolve(True))
-        crates[-1]["source"] = {
+        crate["env"]["OBJTREE"] = str(objtree.resolve(True))
+        crate["source"] = {
             "include_dirs": [
                 str(srctree / "rust" / display_name),
                 str(objtree / "rust"),
             ],
             "exclude_dirs": [],
         }
+        register_crate(crate)
 
     append_crate_with_generated("bindings", ["core", "ffi", "pin_init"])
     append_crate_with_generated("uapi", ["core", "ffi", "pin_init"])
