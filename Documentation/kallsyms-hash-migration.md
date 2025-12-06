@@ -41,6 +41,7 @@ APIs, optional strict mode, incremental conversions).
   - Introduce the new identity/display APIs and types.
   - Add `CONFIG_KALLSYMS_STRICT_ID` (under DEBUG/EXPERT, default n) that hides legacy prototypes and turns legacy use into build errors. Enable this in CI/-next to force compiler-driven coverage without burdening regular builds.
   - For normal builds, keep legacy wrappers but add compiler diagnostics (e.g., `#pragma GCC diagnostic warning` around the prototypes) so `W=1` surfaces stragglers.
+  - Remove `KSYM_NAME_LEN`/`KSYM_SYMBOL_LEN` entirely: lengths come from the tables or from caller-provided buffers. This must be complete before posting to LKML so downstream users cannot continue depending on the legacy constants.
 - Type separation:
   - Identity consumers take `struct ksym_id`, not `const char *`. Display consumers take buffers/len for printable names. This makes misuse a type error when strict mode is on.
 - Rollout steps:
@@ -66,8 +67,9 @@ Series B (early conversions + tooling):
 
 Series C (enforcement and cleanup in -next/CI):
 9. Enable `CONFIG_KALLSYMS_STRICT_ID=y` in -next/CI configs; fix resulting build errors in batches.
-10. Gate legacy wrappers behind EXPERT or drop them once the tree is clean under strict mode.
-11. Remove temporary diagnostics once no users remain.
+10. Delete `KSYM_NAME_LEN`/`KSYM_SYMBOL_LEN` and any buffer assumptions; push explicit lengths or table-derived lengths through all call sites so the constants disappear.
+11. Gate legacy wrappers behind EXPERT or drop them once the tree is clean under strict mode.
+12. Remove temporary diagnostics once no users remain.
 
 ## Workflow (with b4)
 
