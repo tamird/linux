@@ -24,6 +24,12 @@
 struct cred;
 struct module;
 
+struct ksym_id {
+	u64 hash;
+	u32 len;
+	u8 type;
+};
+
 static inline int is_kernel_text(unsigned long addr)
 {
 	if (__is_kernel_text(addr))
@@ -73,6 +79,7 @@ int kallsyms_on_each_symbol(int (*fn)(void *, const char *, unsigned long),
 			    void *data);
 int kallsyms_on_each_match_symbol(int (*fn)(void *, unsigned long),
 				  const char *name, void *data);
+int kallsyms_get_id(unsigned long addr, struct ksym_id *id);
 
 /* Lookup the address for a symbol. Returns 0 if not found. */
 unsigned long kallsyms_lookup_name(const char *name);
@@ -101,6 +108,11 @@ int lookup_symbol_name(unsigned long addr, char *symname);
 static inline unsigned long kallsyms_lookup_name(const char *name)
 {
 	return 0;
+}
+
+static inline int kallsyms_get_id(unsigned long addr, struct ksym_id *id)
+{
+	return -EOPNOTSUPP;
 }
 
 static inline int kallsyms_lookup_size_offset(unsigned long addr,

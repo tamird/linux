@@ -1973,6 +1973,16 @@ config KALLSYMS
 	  symbolic stack backtraces. This increases the size of the kernel
 	  somewhat, as all symbols have to be loaded into the kernel image.
 
+config KALLSYMS_STRICT_ID
+	bool "Enable kallsyms identity strict mode"
+	depends on KALLSYMS && DEBUG_KERNEL
+	default n
+	help
+	  Provide an opt-in path to steer callers toward the new identity
+	  (hash/type/len) kallsyms interfaces. When enabled, legacy string
+	  lookups may be hidden or turned into build-time diagnostics in
+	  follow-on changes. Keep disabled for normal builds.
+
 config KALLSYMS_SELFTEST
 	bool "Test the basic functions and performance of kallsyms"
 	depends on KALLSYMS

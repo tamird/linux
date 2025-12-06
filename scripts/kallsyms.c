@@ -26,6 +26,7 @@
 #include <string.h>
 #include <ctype.h>
 #include <limits.h>
+#include <stdint.h>
 
 #include <xalloc.h>
 
@@ -63,6 +64,64 @@ static int token_profit[0x10000];
 /* the table that holds the result of the compression */
 static unsigned char best_table[256][2];
 static unsigned char best_table_len[256];
+
+static uint64_t hash_key[2] = {
+	0x243f6a8885a308d3ULL,
+	0x13198a2e03707344ULL,
+};
+
+#define SIPROUND(v0, v1, v2, v3) do {		\
+	v0 += v1; v2 += v3;			\
+	v1 = (v1 << 13) | (v1 >> 51);		\
+	v3 = (v3 << 16) | (v3 >> 48);		\
+	v1 ^= v0; v3 ^= v2;			\
+	v0 = (v0 << 32) | (v0 >> 32);		\
+	v2 += v1; v0 += v3;			\
+	v1 = (v1 << 17) | (v1 >> 47);		\
+	v3 = (v3 << 21) | (v3 >> 43);		\
+	v1 ^= v2; v3 ^= v0;			\
+	v2 = (v2 << 32) | (v2 >> 32);		\
+} while (0)
+
+static uint64_t siphash24(const uint8_t *in, size_t inlen,
+			  const uint64_t key[2])
+{
+	uint64_t v0 = 0x736f6d6570736575ULL ^ key[0];
+	uint64_t v1 = 0x646f72616e646f6dULL ^ key[1];
+	uint64_t v2 = 0x6c7967656e657261ULL ^ key[0];
+	uint64_t v3 = 0x7465646279746573ULL ^ key[1];
+	uint64_t last = (uint64_t)inlen << 56;
+	size_t i;
+
+	while (inlen >= 8) {
+		uint64_t m;
+
+		memcpy(&m, in, sizeof(m));
+		in += 8;
+		inlen -= 8;
+		v3 ^= m;
+		SIPROUND(v0, v1, v2, v3);
+		SIPROUND(v0, v1, v2, v3);
+		v0 ^= m;
+	}
+
+	for (i = 0; i < inlen; ++i)
+		last |= (uint64_t)in[i] << (8 * i);
+
+	v3 ^= last;
+	SIPROUND(v0, v1, v2, v3);
+	SIPROUND(v0, v1, v2, v3);
+	v0 ^= last;
+
+	v2 ^= 0xff;
+	SIPROUND(v0, v1, v2, v3);
+	SIPROUND(v0, v1, v2, v3);
+	SIPROUND(v0, v1, v2, v3);
+	SIPROUND(v0, v1, v2, v3);
+
+	return v0 ^ v1 ^ v2 ^ v3;
+}
+#undef SIPROUND
 
 
 static void usage(void)
@@ -470,6 +529,29 @@ static void write_src(void)
 			(unsigned char)(table[i]->seq >> 8),
 			(unsigned char)(table[i]->seq >> 0),
 		       table[i]->sym);
+	printf("\n");
+
+	output_label("kallsyms_hashes");
+	for (i = 0; i < table_cnt; i++)
+		printf("\t.quad\t0x%016llx\t/* %s */\n",
+		       (unsigned long long)
+		       siphash24((uint8_t *)sym_name(table[i]),
+				 strlen(sym_name(table[i])),
+				 hash_key),
+		       sym_name(table[i]));
+	printf("\n");
+
+	output_label("kallsyms_uncompressed_lens");
+	for (i = 0; i < table_cnt; i++)
+		printf("\t.long\t%zu\t/* %s */\n",
+		       strlen(sym_name(table[i])),
+		       sym_name(table[i]));
+	printf("\n");
+
+	output_label("kallsyms_sym_types");
+	for (i = 0; i < table_cnt; i++)
+		printf("\t.byte\t%d\t/* %s */\n", table[i]->sym[0],
+		       sym_name(table[i]));
 	printf("\n");
 }
 

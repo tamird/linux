@@ -15,5 +15,8 @@ extern const u16 kallsyms_token_index[];
 
 extern const unsigned int kallsyms_markers[];
 extern const u8 kallsyms_seqs_of_names[];
+extern const u64 kallsyms_hashes[];
+extern const u32 kallsyms_uncompressed_lens[];
+extern const u8 kallsyms_sym_types[];
 
 #endif // LINUX_KALLSYMS_INTERNAL_H_

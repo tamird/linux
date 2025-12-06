@@ -96,19 +96,11 @@ tail:
 }
 
 /*
- * Get symbol type information. This is encoded as a single char at the
- * beginning of the symbol name.
+ * Get symbol type information.
  */
-static char kallsyms_get_symbol_type(unsigned int off)
+static char kallsyms_get_symbol_type(unsigned int idx)
 {
-	/*
-	 * Get just the first code, look it up in the token table,
-	 * and return the first char from this token. If MSB of length
-	 * is 1, it is a "big" symbol, so needs an additional byte.
-	 */
-	if (kallsyms_names[off] & 0x80)
-		off++;
-	return kallsyms_token_table[kallsyms_token_index[kallsyms_names[off + 1]]];
+	return kallsyms_sym_types[idx];
 }
 
 
@@ -331,6 +323,26 @@ static unsigned long get_symbol_pos(unsigned long addr,
 
 	return low;
 }
+
+int kallsyms_get_id(unsigned long addr, struct ksym_id *id)
+{
+	if (!id)
+		return -EINVAL;
+
+	if (!is_ksym_addr(addr))
+		return -ENOENT;
+
+	{
+		unsigned long pos = get_symbol_pos(addr, NULL, NULL);
+
+		id->len = kallsyms_uncompressed_lens[pos];
+		id->hash = kallsyms_hashes[pos];
+		id->type = kallsyms_sym_types[pos];
+	}
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(kallsyms_get_id);
 
 /*
  * Lookup an address but don't bother to find any names.
@@ -640,7 +652,7 @@ static unsigned long get_ksymbol_core(struct kallsym_iter *iter)
 	iter->module_name[0] = '\0';
 	iter->value = kallsyms_sym_address(iter->pos);
 
-	iter->type = kallsyms_get_symbol_type(off);
+	iter->type = kallsyms_get_symbol_type(iter->pos);
 
 	off = kallsyms_expand_symbol(off, iter->name, ARRAY_SIZE(iter->name));
 
