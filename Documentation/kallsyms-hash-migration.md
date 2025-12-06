@@ -42,6 +42,7 @@ APIs, optional strict mode, incremental conversions).
   - Add `CONFIG_KALLSYMS_STRICT_ID` (under DEBUG/EXPERT, default n) that hides legacy prototypes and turns legacy use into build errors. Enable this in CI/-next to force compiler-driven coverage without burdening regular builds.
   - For normal builds, keep legacy wrappers but add compiler diagnostics (e.g., `#pragma GCC diagnostic warning` around the prototypes) so `W=1` surfaces stragglers.
   - Remove `KSYM_NAME_LEN`/`KSYM_SYMBOL_LEN` entirely: lengths come from the tables or from caller-provided buffers. This must be complete before posting to LKML so downstream users cannot continue depending on the legacy constants.
+  - Stop double-storing length/type: move string expansion to use the dedicated length/type tables, then remove length/type/terminator dependence from the compressed blob once consumers are switched.
 - Type separation:
   - Identity consumers take `struct ksym_id`, not `const char *`. Display consumers take buffers/len for printable names. This makes misuse a type error when strict mode is on.
 - Rollout steps:
