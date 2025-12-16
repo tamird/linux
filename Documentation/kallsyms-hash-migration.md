@@ -22,8 +22,8 @@ APIs, optional strict mode, incremental conversions).
 ## Kernel implementation sketch
 
 - Build artifacts:
-  - `kallsyms_hashes`, `kallsyms_uncompressed_lens`, and `kallsyms_sym_types` emitted for vmlinux and modules.
-  - Printable (demangled where applicable) strings kept for legacy interfaces; mangled strings kept only if explicitly requested (debug knob).
+  - `kallsyms_hashes` emitted for vmlinux and modules.
+  - Printable (demangled where applicable) strings kept for legacy interfaces; mangled strings kept only if explicitly requested (debug knob). Length/type can be derived from the compressed stream until the format is slimmed.
 - APIs (additive, type-separated):
   - Identity: `struct ksym_id { u64 hash; u32 len; u8 type; }` plus helpers (`kallsyms_get_id()`, `kallsyms_lookup_id()`), and module/BPF/ftrace equivalents. Resolution/matching paths take `struct ksym_id`.
   - Display: `kallsyms_get_printable()` (bounded expansion into caller buffer) for user-facing output. Keep `%pS`, `/proc/kallsyms`, perf, trace printing on this path.
