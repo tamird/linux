@@ -534,24 +534,11 @@ static void write_src(void)
 	output_label("kallsyms_hashes");
 	for (i = 0; i < table_cnt; i++)
 		printf("\t.quad\t0x%016llx\t/* %s */\n",
-		       (unsigned long long)
-		       siphash24((uint8_t *)sym_name(table[i]),
-				 strlen(sym_name(table[i])),
-				 hash_key),
-		       sym_name(table[i]));
-	printf("\n");
-
-	output_label("kallsyms_uncompressed_lens");
-	for (i = 0; i < table_cnt; i++)
-		printf("\t.long\t%zu\t/* %s */\n",
-		       strlen(sym_name(table[i])),
-		       sym_name(table[i]));
-	printf("\n");
-
-	output_label("kallsyms_sym_types");
-	for (i = 0; i < table_cnt; i++)
-		printf("\t.byte\t%d\t/* %s */\n", table[i]->sym[0],
-		       sym_name(table[i]));
+			(unsigned long long)
+			siphash24((uint8_t *)sym_name(table[i]),
+				strlen(sym_name(table[i])),
+				hash_key),
+			sym_name(table[i]));
 	printf("\n");
 }
 

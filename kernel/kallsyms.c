@@ -102,9 +102,20 @@ tail:
  */
 static char kallsyms_get_symbol_type(unsigned int idx)
 {
-	return kallsyms_sym_types[idx];
-}
+	unsigned int off = get_symbol_offset(idx);
+	unsigned int clen;
+	const u8 *data;
 
+	data = &kallsyms_names[off];
+	clen = *data++;
+
+	if (clen & 0x80) {
+		clen = (clen & 0x7f) | (*data << 7);
+		data++;
+	}
+
+	return kallsyms_token_table[kallsyms_token_index[*data]];
+}
 
 /*
  * Find the offset on the compressed stream given and index in the
@@ -328,19 +339,45 @@ static unsigned long get_symbol_pos(unsigned long addr,
 
 int kallsyms_get_id(unsigned long addr, struct ksym_id *id)
 {
+	unsigned long pos;
+	unsigned int clen;
+	const char *tptr;
+	const u8 *data;
+	unsigned int len = 0;
+	bool first_token = true;
+
 	if (!id)
 		return -EINVAL;
 
 	if (!is_ksym_addr(addr))
 		return -ENOENT;
 
-	{
-		unsigned long pos = get_symbol_pos(addr, NULL, NULL);
+	pos = get_symbol_pos(addr, NULL, NULL);
 
-		id->len = kallsyms_uncompressed_lens[pos];
-		id->hash = kallsyms_hashes[pos];
-		id->type = kallsyms_sym_types[pos];
+	data = &kallsyms_names[get_symbol_offset(pos)];
+	clen = *data++;
+
+	if (clen & 0x80) {
+		clen = (clen & 0x7f) | (*data << 7);
+		data++;
 	}
+
+	while (clen) {
+		tptr = &kallsyms_token_table[kallsyms_token_index[*data]];
+		data++;
+		clen--;
+		if (first_token) {
+			id->type = *tptr;
+			if (*tptr)
+				len += strlen(tptr) - 1;
+			first_token = false;
+		} else {
+			len += strlen(tptr);
+		}
+	}
+
+	id->len = len;
+	id->hash = kallsyms_hashes[pos];
 
 	return 0;
 }
