@@ -67,7 +67,7 @@ cfgs-to-flags = $(patsubst %,--cfg='%',$1)
 core-cfgs := \
     no_fp_fmt_parse
 
-core-edition := $(if $(call rustc-min-version,108700),2024,2021)
+sysroot_edition := $(if $(call rustc-min-version,108700),2024,2021)
 
 core-skip_flags := \
     --edition=2021 \
@@ -75,7 +75,7 @@ core-skip_flags := \
     -Wrustdoc::unescaped_backticks
 
 core-flags := \
-    --edition=$(core-edition) \
+    --edition=$(sysroot_edition) \
     $(call cfgs-to-flags,$(core-cfgs))
 
 proc_macro2-cfgs := \
@@ -383,6 +383,7 @@ bindgen_skip_c_flags := -mno-fp-ret-in-387 -mpreferred-stack-boundary=% \
 	-fno-inline-functions-called-once -fsanitize=bounds-strict \
 	-fstrict-flex-arrays=% -fmin-function-alignment=% \
 	-fzero-init-padding-bits=% -mno-fdpic \
+	-fdiagnostics-show-context -fdiagnostics-show-context=% \
 	--param=% --param asan-% -fno-isolate-erroneous-paths-dereference
 
 # Derived from `scripts/Makefile.clang`.
@@ -566,7 +567,8 @@ quiet_cmd_rustc_library = $(if $(skip_clippy),RUSTC,$(RUSTC_OR_CLIPPY_QUIET)) L 
 
 rust-analyzer:
 	$(Q)MAKEFLAGS= $(srctree)/scripts/generate_rust_analyzer.py \
-		--cfgs='core=$(core-cfgs)' $(core-edition) \
+		$(sysroot_edition) \
+		--cfgs='core=$(core-cfgs)' \
 		--cfgs='proc_macro2=$(proc_macro2-cfgs)' \
 		--cfgs='quote=$(quote-cfgs)' \
 		--cfgs='syn=$(syn-cfgs)' \
