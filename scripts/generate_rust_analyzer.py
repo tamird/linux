@@ -43,7 +43,7 @@ def generate_crates(srctree, objtree, sysroot_src, external_src, cfgs, sysroot_e
             "root_module": str(root_module),
             "is_workspace_member": is_workspace_member,
             "deps": [{"crate": crates_indexes[dep], "name": dep} for dep in deps],
-            "cfg": cfg,
+            "cfg": cfg + crates_cfgs.get(display_name, []),
             "edition": edition,
             "env": {
                 "RUST_MODFILE": "This is only for rust-analyzer"
@@ -92,7 +92,7 @@ def generate_crates(srctree, objtree, sysroot_src, external_src, cfgs, sysroot_e
     # NB: sysroot crates reexport items from one another so setting up our transitive dependencies
     # here is important for ensuring that rust-analyzer can resolve symbols. The sources of truth
     # for this dependency graph are `(sysroot_src / crate / "Cargo.toml" for crate in crates)`.
-    append_sysroot_crate("core", [], cfg=crates_cfgs.get("core", []))
+    append_sysroot_crate("core", [])
     append_sysroot_crate("alloc", ["core"])
     append_sysroot_crate("std", ["alloc", "core"])
     append_sysroot_crate("proc_macro", ["core", "std"])
@@ -107,14 +107,12 @@ def generate_crates(srctree, objtree, sysroot_src, external_src, cfgs, sysroot_e
         "proc_macro2",
         srctree / "rust" / "proc-macro2" / "lib.rs",
         ["core", "alloc", "std", "proc_macro"],
-        cfg=crates_cfgs["proc_macro2"],
     )
 
     append_crate(
         "quote",
         srctree / "rust" / "quote" / "lib.rs",
         ["alloc", "proc_macro", "proc_macro2"],
-        cfg=crates_cfgs["quote"],
         edition="2018",
     )
 
@@ -122,7 +120,6 @@ def generate_crates(srctree, objtree, sysroot_src, external_src, cfgs, sysroot_e
         "syn",
         srctree / "rust" / "syn" / "lib.rs",
         ["proc_macro", "proc_macro2", "quote"],
-        cfg=crates_cfgs["syn"],
     )
 
     append_proc_macro_crate(
