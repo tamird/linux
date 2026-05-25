@@ -31,7 +31,7 @@ use kernel::{
 
 use crate::{context::Context, page_range::Shrinker, process::Process, thread::Thread};
 
-use core::ptr::NonNull;
+use core::{mem::size_of, ptr::NonNull};
 
 mod allocation;
 mod context;
@@ -141,6 +141,11 @@ impl<'a> BinderReturnWriter<'a> {
 /// implement dynamic dispatch over many different types. This lets us store many different types
 /// in the todo list.
 trait DeliverToRead: ListArcSafe + Send + Sync {
+    /// Minimum space required in the read buffer to deliver this item.
+    fn required_read_size(&self) -> usize {
+        size_of::<defs::BinderTransactionDataSecctx>() + size_of::<u32>()
+    }
+
     /// Performs work. Returns true if remaining work items in the queue should be processed
     /// immediately, or false if it should return to caller before processing additional work
     /// items.

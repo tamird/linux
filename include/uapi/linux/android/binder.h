@@ -49,6 +49,16 @@ enum flat_binder_object_flags {
 	 * context
 	 */
 	FLAT_BINDER_FLAG_TXN_SECURITY_CTX = 0x1000,
+
+	/**
+	 * @FLAT_BINDER_FLAG_MULTIPLEXED_DELIVERY:
+	 * receive two-way transactions through the multiplexed protocol
+	 *
+	 * When set, two-way transactions sent to the node are received through
+	 * BR_TRANSACTION_MULTIPLEXED, including transactions submitted with
+	 * BC_TRANSACTION by callers using the ordinary protocol.
+	 */
+	FLAT_BINDER_FLAG_MULTIPLEXED_DELIVERY = 0x2000,
 };
 
 #ifdef BINDER_IPC_32BIT
@@ -343,6 +353,117 @@ struct binder_transaction_data_sg {
 	binder_size_t buffers_size;
 };
 
+/*
+ * Multiplexed transactions are two-way calls which do not participate in the
+ * caller's synchronous transaction stack. TF_ONE_WAY and TF_UPDATE_TXN are
+ * invalid for BC_TRANSACTION_MULTIPLEXED. A node must have multiplexed
+ * delivery enabled to accept such a request.
+ *
+ * Terminal results for explicitly multiplexed callers are associated with the
+ * target binder node, not the
+ * thread or binder endpoint submitting the request. request_id is an opaque
+ * userspace tag, may be zero, and is not required to be unique. Subject to
+ * binder's transaction security check, any process holding a strong handle
+ * to the target node may post a reply claim with BC_CLAIM_MULTIPLEXED_REPLY.
+ *
+ * Two-way ordinary transactions targeting a node with multiplexed delivery are
+ * delivered to its owner through BR_TRANSACTION_MULTIPLEXED, with
+ * BINDER_MULTIPLEXED_DELIVERY_ORDINARY in delivery_flags. A token reply to
+ * such a transaction is delivered back to its caller as an ordinary BR_REPLY.
+ * A server may therefore adopt multiplexed request dispatch without requiring
+ * existing callers to change protocols. This does not preserve synchronous
+ * nested-call routing back to the ordinary caller's blocked thread.
+ *
+ * Explicitly multiplexed requests and their terminal replies have no
+ * scatter-gather variants and cannot carry payloads which require struct
+ * binder_transaction_data_sg.
+ */
+struct binder_multiplexed_transaction {
+	struct binder_transaction_data transaction_data;
+	__aligned_u64 request_id;
+};
+
+/*
+ * A reply_token is an opaque, single-use capability scoped to the binder
+ * endpoint receiving the request. Any thread submitting a reply through that
+ * same endpoint may use it. Freeing the transaction buffer does not invalidate
+ * the token. TF_ONE_WAY and TF_UPDATE_TXN are invalid for
+ * BC_REPLY_MULTIPLEXED. BC_REPLY_MULTIPLEXED_SG may be used only when
+ * BINDER_MULTIPLEXED_DELIVERY_ORDINARY was reported for the request. A reply
+ * to an explicitly multiplexed request is retained on the target node until
+ * paired with a posted claim. Pending multiplexed transaction state keeps the
+ * target node resident if ordinary references are released.
+ * BC_RETIRE_MULTIPLEXED_NODE terminates this state for one node;
+ * unfinished requests receive BINDER_MULTIPLEXED_REPLY_SHUTDOWN. Closing the
+ * owning endpoint terminates the state on all such nodes; unfinished requests
+ * receive BINDER_MULTIPLEXED_REPLY_DEAD. In either case, available posted
+ * claims are paired with terminal results; other state is abandoned,
+ * outstanding reply tokens are invalidated, and new transactions and claims
+ * are rejected. Retirement does not retract a transaction already copied
+ * into a concurrent read; any reply token from such a delivery is invalid.
+ *
+ * Replies to explicitly multiplexed requests are translated for the claiming
+ * process, which is not known when BC_REPLY_MULTIPLEXED is submitted. Such
+ * replies must therefore have offsets_size zero.
+ */
+enum binder_multiplexed_delivery_flags {
+	BINDER_MULTIPLEXED_DELIVERY_ORDINARY = 0x1,
+};
+
+struct binder_multiplexed_transaction_received {
+	struct binder_transaction_data transaction_data;
+	__aligned_u64 request_id;
+	__aligned_u64 reply_token;
+	__u32 delivery_flags;
+	/* Must be zero. */
+	__u32 reserved;
+};
+
+struct binder_multiplexed_transaction_secctx_received {
+	struct binder_multiplexed_transaction_received transaction;
+	binder_uintptr_t secctx;
+};
+
+struct binder_multiplexed_reply {
+	struct binder_transaction_data transaction_data;
+	__aligned_u64 reply_token;
+};
+
+struct binder_multiplexed_reply_sg {
+	struct binder_transaction_data_sg transaction_data;
+	__aligned_u64 reply_token;
+};
+
+struct binder_multiplexed_reply_claim {
+	__u32 handle;
+	/* Must be zero. */
+	__u32 reserved;
+	/* Opaque identifier copied into the terminal return for this claim. */
+	__aligned_u64 claim_id;
+};
+
+struct binder_multiplexed_reply_received {
+	struct binder_transaction_data transaction_data;
+	__aligned_u64 request_id;
+	__aligned_u64 claim_id;
+};
+
+enum binder_multiplexed_reply_error_reason {
+	BINDER_MULTIPLEXED_REPLY_DEAD = 1,
+	BINDER_MULTIPLEXED_REPLY_SHUTDOWN,
+	BINDER_MULTIPLEXED_REPLY_FAILED,
+	BINDER_MULTIPLEXED_REPLY_FROZEN,
+	BINDER_MULTIPLEXED_REPLY_RESOURCE_EXHAUSTED,
+};
+
+struct binder_multiplexed_reply_error {
+	__aligned_u64 request_id;
+	__aligned_u64 claim_id;
+	__u32 reason;
+	/* Zero, or a negative errno value further describing this failure. */
+	__s32 error;
+};
+
 struct binder_ptr_cookie {
 	binder_uintptr_t ptr;
 	binder_uintptr_t cookie;
@@ -484,6 +605,27 @@ enum binder_driver_return_protocol {
 	/*
 	 * void *: cookie
 	 */
+
+	BR_TRANSACTION_MULTIPLEXED = _IOR('r', 23,
+					struct binder_multiplexed_transaction_received),
+	BR_TRANSACTION_MULTIPLEXED_SEC_CTX = _IOR('r', 24,
+					struct binder_multiplexed_transaction_secctx_received),
+	/*
+	 * Multiplexed command received by a target supporting this mode.
+	 */
+
+	BR_REPLY_MULTIPLEXED = _IOR('r', 25,
+				    struct binder_multiplexed_reply_received),
+	/*
+	 * Terminal successful reply to a multiplexed request.
+	 */
+
+	BR_REPLY_MULTIPLEXED_ERROR = _IOR('r', 26,
+					  struct binder_multiplexed_reply_error),
+	/*
+	 * Terminal failed reply to a multiplexed request.
+	 */
+
 };
 
 enum binder_driver_command_protocol {
@@ -586,7 +728,41 @@ enum binder_driver_command_protocol {
 	/*
 	 * void *: cookie
 	 */
+
+	BC_TRANSACTION_MULTIPLEXED = _IOW('c', 22,
+					  struct binder_multiplexed_transaction),
+	/*
+	 * A stackless two-way transaction carrying a caller request identifier.
+	 */
+
+	BC_REPLY_MULTIPLEXED = _IOW('c', 23, struct binder_multiplexed_reply),
+	/*
+	 * Reply to a multiplexed transaction using its opaque reply token.
+	 */
+
+	BC_REPLY_MULTIPLEXED_SG = _IOW('c', 24,
+					 struct binder_multiplexed_reply_sg),
+	/*
+	 * Scatter-gather token reply for an ordinary caller using a node with
+	 * multiplexed delivery. This is invalid for an explicitly multiplexed
+	 * request.
+	 */
+
+	BC_CLAIM_MULTIPLEXED_REPLY = _IOW('c', 25,
+					  struct binder_multiplexed_reply_claim),
+	/*
+	 * Post a reply claim for one unclaimed outstanding multiplexed request on
+	 * a node. Closing the claiming endpoint withdraws an unpaired
+	 * claim without cancelling the request. Claiming is subject to the binder
+	 * transaction security check from the node owner to the claimant.
+	 */
+
+	BC_RETIRE_MULTIPLEXED_NODE = _IOW('c', 26, struct binder_ptr_cookie),
+	/*
+	 * Retire a multiplexed node owned by this endpoint.
+	 * Pending transactions are terminated, outstanding reply tokens are
+	 * invalidated, and future transactions and claims are rejected.
+	 */
 };
 
 #endif /* _UAPI_LINUX_BINDER_H */
-

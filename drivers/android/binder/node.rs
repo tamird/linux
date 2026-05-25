@@ -5,10 +5,13 @@
 use kernel::{
     list::{AtomicTracker, List, ListArc, ListLinks, TryNewListArc},
     prelude::*,
+    rbtree::{RBTree, RBTreeNodeReservation},
     seq_file::SeqFile,
     seq_print,
+    sync::atomic::{ordering::Relaxed, Atomic},
     sync::lock::{spinlock::SpinLockBackend, Guard},
     sync::{Arc, LockedBy, SpinLock},
+    task::Kuid,
 };
 
 use crate::{
@@ -16,7 +19,7 @@ use crate::{
     error::BinderError,
     process::{NodeRefInfo, Process, ProcessInner},
     thread::Thread,
-    transaction::Transaction,
+    transaction::{Transaction, TransactionInfo},
     BinderReturnWriter, DArc, DLArc, DTRWrap, DeliverToRead,
 };
 
@@ -176,6 +179,65 @@ struct NodeInner {
     active_inc_refs: u8,
     /// List of `NodeRefInfo` objects that reference this node.
     refs: List<NodeRefInfo, { NodeRefInfo::LIST_NODE }>,
+    multiplexed_requests: RBTree<u64, MultiplexedRequest>,
+    multiplexed_claims: List<DTRWrap<MultiplexedClaimWork>, 1>,
+    next_multiplexed_request: u64,
+    next_multiplexed_terminal: u64,
+    multiplexed_retired: bool,
+}
+
+const MAX_PENDING_MULTIPLEXED_REQUESTS: usize = 1024;
+const MAX_PENDING_MULTIPLEXED_REPLY_BYTES: usize = kernel::bindings::SZ_4M as usize;
+
+enum MultiplexedTerminal {
+    Reply(MultiplexedReplyPayload),
+    Error { reason: u32, error: i32 },
+}
+
+impl MultiplexedTerminal {
+    fn reply_bytes(&self) -> usize {
+        match self {
+            Self::Reply(reply) => reply.data.len(),
+            Self::Error { .. } => 0,
+        }
+    }
+}
+
+enum MultiplexedRequestState {
+    Pending,
+    ReplyReserved {
+        bytes: usize,
+    },
+    Ready {
+        sequence: u64,
+        terminal: MultiplexedTerminal,
+    },
+    Claimed {
+        sequence: u64,
+    },
+}
+
+struct MultiplexedRequest {
+    request_id: u64,
+    state: MultiplexedRequestState,
+}
+
+pub(crate) struct MultiplexedReplyPayload {
+    code: u32,
+    flags: u32,
+    data: KVec<u8>,
+    sender_euid: Kuid,
+}
+
+impl MultiplexedReplyPayload {
+    pub(crate) fn new(code: u32, flags: u32, data: KVec<u8>) -> Self {
+        Self {
+            code,
+            flags,
+            data,
+            sender_euid: Kuid::current_euid(),
+        }
+    }
 }
 
 use kernel::bindings::rb_node_layout;
@@ -236,6 +298,11 @@ impl Node {
                     has_oneway_transaction: false,
                     active_inc_refs: 0,
                     refs: List::new(),
+                    multiplexed_requests: RBTree::new(),
+                    multiplexed_claims: List::new(),
+                    next_multiplexed_request: 0,
+                    next_multiplexed_terminal: 0,
+                    multiplexed_retired: false,
                 },
             ),
             debug_id: super::next_debug_id(),
@@ -326,6 +393,365 @@ impl Node {
 
     pub(crate) fn get_id(&self) -> (u64, u64) {
         (self.ptr, self.cookie)
+    }
+
+    pub(crate) fn uses_multiplexed_delivery(&self) -> bool {
+        self.flags & FLAT_BINDER_FLAG_MULTIPLEXED_DELIVERY != 0
+    }
+
+    pub(crate) fn is_multiplexed_retired(
+        &self,
+        guard: &Guard<'_, ProcessInner, SpinLockBackend>,
+    ) -> bool {
+        self.inner.access(guard).multiplexed_retired
+    }
+
+    pub(crate) fn accept_multiplexed_request(&self, request_id: u64) -> Result<u64> {
+        let reservation = RBTreeNodeReservation::new(GFP_KERNEL)?;
+        let mut guard = self.owner.inner.lock();
+        if guard.is_dead {
+            return Err(ESRCH);
+        }
+        let inner = self.inner.access_mut(&mut guard);
+        if inner.multiplexed_retired {
+            return Err(ESRCH);
+        }
+        if inner.multiplexed_requests.iter().count() >= MAX_PENDING_MULTIPLEXED_REQUESTS {
+            return Err(ENOSPC);
+        }
+        let key = inner
+            .next_multiplexed_request
+            .checked_add(1)
+            .ok_or(ENOSPC)?;
+        inner.next_multiplexed_request = key;
+        inner.multiplexed_requests.insert(reservation.into_node(
+            key,
+            MultiplexedRequest {
+                request_id,
+                state: MultiplexedRequestState::Pending,
+            },
+        ));
+        Ok(key)
+    }
+
+    pub(crate) fn can_issue_multiplexed_reply(
+        &self,
+        key: u64,
+        guard: &mut Guard<'_, ProcessInner, SpinLockBackend>,
+    ) -> bool {
+        let inner = self.inner.access_mut(guard);
+        !inner.multiplexed_retired
+            && matches!(
+                inner
+                    .multiplexed_requests
+                    .get(&key)
+                    .map(|request| &request.state),
+                Some(MultiplexedRequestState::Pending)
+            )
+    }
+
+    pub(crate) fn fail_multiplexed_request(&self, key: u64, reason: u32, error: i32) {
+        {
+            let mut guard = self.owner.inner.lock();
+            let reserved = {
+                let inner = self.inner.access_mut(&mut guard);
+                match inner.multiplexed_requests.get(&key).map(|r| &r.state) {
+                    Some(MultiplexedRequestState::Pending) => 0,
+                    Some(MultiplexedRequestState::ReplyReserved { bytes }) => *bytes,
+                    _ => return,
+                }
+            };
+            guard.multiplexed_reply_bytes -= reserved;
+            let inner = self.inner.access_mut(&mut guard);
+            inner.next_multiplexed_terminal = inner.next_multiplexed_terminal.wrapping_add(1);
+            let sequence = inner.next_multiplexed_terminal;
+            inner.multiplexed_requests.get_mut(&key).unwrap().state =
+                MultiplexedRequestState::Ready {
+                    sequence,
+                    terminal: MultiplexedTerminal::Error { reason, error },
+                };
+        }
+        self.dispatch_multiplexed_claims();
+    }
+
+    pub(crate) fn reserve_multiplexed_reply_payload(
+        &self,
+        key: u64,
+        size: usize,
+        guard: &mut Guard<'_, ProcessInner, SpinLockBackend>,
+    ) -> Result {
+        {
+            let inner = self.inner.access_mut(guard);
+            if !matches!(
+                inner.multiplexed_requests.get(&key).map(|r| &r.state),
+                Some(MultiplexedRequestState::Pending)
+            ) {
+                return Err(ESRCH);
+            }
+        }
+        if guard
+            .multiplexed_reply_bytes
+            .checked_add(size)
+            .is_none_or(|bytes| bytes > MAX_PENDING_MULTIPLEXED_REPLY_BYTES)
+        {
+            return Err(ENOSPC);
+        }
+        guard.multiplexed_reply_bytes += size;
+        let inner = self.inner.access_mut(guard);
+        inner.multiplexed_requests.get_mut(&key).unwrap().state =
+            MultiplexedRequestState::ReplyReserved { bytes: size };
+        Ok(())
+    }
+
+    pub(crate) fn cancel_multiplexed_reply_payload(
+        &self,
+        key: u64,
+        guard: &mut Guard<'_, ProcessInner, SpinLockBackend>,
+    ) {
+        let bytes = {
+            let inner = self.inner.access_mut(guard);
+            let Some(MultiplexedRequestState::ReplyReserved { bytes }) = inner
+                .multiplexed_requests
+                .get(&key)
+                .map(|request| &request.state)
+            else {
+                return;
+            };
+            *bytes
+        };
+        guard.multiplexed_reply_bytes -= bytes;
+        let inner = self.inner.access_mut(guard);
+        inner.multiplexed_requests.get_mut(&key).unwrap().state = MultiplexedRequestState::Pending;
+    }
+
+    pub(crate) fn queue_multiplexed_reply(
+        &self,
+        key: u64,
+        reply: MultiplexedReplyPayload,
+        guard: &mut Guard<'_, ProcessInner, SpinLockBackend>,
+    ) -> Result {
+        let inner = self.inner.access_mut(guard);
+        if !matches!(
+            inner.multiplexed_requests.get(&key).map(|r| &r.state),
+            Some(MultiplexedRequestState::ReplyReserved { bytes }) if *bytes == reply.data.len()
+        ) {
+            return Err(ESRCH);
+        }
+        inner.next_multiplexed_terminal = inner.next_multiplexed_terminal.wrapping_add(1);
+        let sequence = inner.next_multiplexed_terminal;
+        inner.multiplexed_requests.get_mut(&key).unwrap().state = MultiplexedRequestState::Ready {
+            sequence,
+            terminal: MultiplexedTerminal::Reply(reply),
+        };
+        Ok(())
+    }
+
+    pub(crate) fn claim_multiplexed_reply(
+        self: &DArc<Self>,
+        recipient: Arc<Process>,
+        claim_id: u64,
+    ) -> Result {
+        let work = MultiplexedClaimWork::try_new(self.clone(), recipient.clone(), claim_id)?;
+        let node_work: ListArc<DTRWrap<MultiplexedClaimWork>, 1> =
+            ListArc::<DTRWrap<MultiplexedClaimWork>, 1>::try_from_arc(work.clone())
+                .ok()
+                .unwrap();
+        let recipient_work: ListArc<DTRWrap<MultiplexedClaimWork>, 2> =
+            ListArc::<DTRWrap<MultiplexedClaimWork>, 2>::try_from_arc(work)
+                .ok()
+                .unwrap();
+        if Arc::ptr_eq(&recipient, &self.owner) {
+            let mut guard = self.owner.inner.lock();
+            if guard.is_dead {
+                return Err(ESRCH);
+            }
+            let inner = self.inner.access_mut(&mut guard);
+            if inner.multiplexed_retired {
+                return Err(ESRCH);
+            }
+            if inner.multiplexed_claims.iter().count()
+                >= inner
+                    .multiplexed_requests
+                    .values()
+                    .filter(|request| {
+                        matches!(
+                            request.state,
+                            MultiplexedRequestState::Pending
+                                | MultiplexedRequestState::ReplyReserved { .. }
+                                | MultiplexedRequestState::Ready { .. }
+                        )
+                    })
+                    .count()
+            {
+                return Err(ENOSPC);
+            }
+            inner.multiplexed_claims.push_back(node_work);
+            guard.pending_multiplexed_claims.push_back(recipient_work);
+        } else {
+            let register = |owner_guard: &mut Guard<'_, ProcessInner, SpinLockBackend>,
+                            recipient_guard: &mut Guard<'_, ProcessInner, SpinLockBackend>|
+             -> Result {
+                if owner_guard.is_dead || recipient_guard.is_dead {
+                    return Err(ESRCH);
+                }
+                let inner = self.inner.access_mut(owner_guard);
+                if inner.multiplexed_retired {
+                    return Err(ESRCH);
+                }
+                if inner.multiplexed_claims.iter().count()
+                    >= inner
+                        .multiplexed_requests
+                        .values()
+                        .filter(|request| {
+                            matches!(
+                                request.state,
+                                MultiplexedRequestState::Pending
+                                    | MultiplexedRequestState::ReplyReserved { .. }
+                                    | MultiplexedRequestState::Ready { .. }
+                            )
+                        })
+                        .count()
+                {
+                    return Err(ENOSPC);
+                }
+                inner.multiplexed_claims.push_back(node_work);
+                recipient_guard
+                    .pending_multiplexed_claims
+                    .push_back(recipient_work);
+                Ok(())
+            };
+            // Transferred nodes permit reciprocal claims between endpoints.
+            // Use a stable order whenever two endpoint locks are needed.
+            if Arc::as_ptr(&recipient) < Arc::as_ptr(&self.owner) {
+                let mut recipient_guard = recipient.inner.lock();
+                let mut owner_guard = self.owner.inner.lock();
+                register(&mut owner_guard, &mut recipient_guard)?;
+            } else {
+                let mut owner_guard = self.owner.inner.lock();
+                let mut recipient_guard = recipient.inner.lock();
+                register(&mut owner_guard, &mut recipient_guard)?;
+            }
+        }
+        self.dispatch_multiplexed_claims();
+        Ok(())
+    }
+
+    fn cancel_multiplexed_claim(&self, claim: &DArc<MultiplexedClaimWork>) {
+        let removed = {
+            let mut guard = self.owner.inner.lock();
+            // SAFETY: A claim is inserted only in the pending-claim list of its node.
+            unsafe {
+                self.inner
+                    .access_mut(&mut guard)
+                    .multiplexed_claims
+                    .remove(claim)
+            }
+        };
+        drop(removed);
+    }
+
+    fn requeue_multiplexed_terminal(&self, key: u64, terminal: MultiplexedTerminal) {
+        let reply_bytes = terminal.reply_bytes();
+        let mut guard = self.owner.inner.lock();
+        let release_bytes = {
+            let inner = self.inner.access_mut(&mut guard);
+            if inner.multiplexed_retired {
+                match inner.multiplexed_requests.get(&key).map(|r| &r.state) {
+                    Some(MultiplexedRequestState::Claimed { .. }) => {
+                        inner.multiplexed_requests.remove(&key);
+                        true
+                    }
+                    None => true,
+                    _ => false,
+                }
+            } else {
+                let sequence = match inner.multiplexed_requests.get(&key).map(|r| &r.state) {
+                    Some(MultiplexedRequestState::Claimed { sequence, .. }) => *sequence,
+                    _ => return,
+                };
+                inner.multiplexed_requests.get_mut(&key).unwrap().state =
+                    MultiplexedRequestState::Ready { sequence, terminal };
+                return;
+            }
+        };
+        if release_bytes {
+            guard.multiplexed_reply_bytes -= reply_bytes;
+        }
+    }
+
+    pub(crate) fn dispatch_multiplexed_claims(&self) {
+        loop {
+            let claimed = {
+                let mut guard = self.owner.inner.lock();
+                let inner = self.inner.access_mut(&mut guard);
+                let Some(work) = inner.multiplexed_claims.pop_front() else {
+                    return;
+                };
+                let mut ready = None;
+                for (key, request) in inner.multiplexed_requests.iter() {
+                    if let MultiplexedRequestState::Ready { sequence, .. } = request.state {
+                        if ready.is_none_or(|(_, old)| sequence < old) {
+                            ready = Some((*key, sequence));
+                        }
+                    }
+                }
+                let Some((key, sequence)) = ready else {
+                    inner.multiplexed_claims.push_front(work);
+                    return;
+                };
+                let request = inner.multiplexed_requests.get_mut(&key).unwrap();
+                let state = mem::replace(
+                    &mut request.state,
+                    MultiplexedRequestState::Claimed { sequence },
+                );
+                if let MultiplexedRequestState::Ready { terminal, .. } = state {
+                    work.set_claim(key, request.request_id, terminal);
+                    Some((work.recipient.clone(), work.into_arc()))
+                } else {
+                    None
+                }
+            };
+            let Some((recipient, work)) = claimed else {
+                continue;
+            };
+            recipient.remove_multiplexed_claim(&work);
+            let work: DLArc<dyn DeliverToRead> = ListArc::try_from_arc(work).ok().unwrap();
+            let _ = recipient.push_work(work);
+        }
+    }
+
+    fn complete_multiplexed_claim(&self, key: u64, reply_bytes: usize) {
+        let mut guard = self.owner.inner.lock();
+        let (completed, remove_node) = {
+            let inner = self.inner.access_mut(&mut guard);
+            let completed = if matches!(
+                inner.multiplexed_requests.get(&key).map(|r| &r.state),
+                Some(MultiplexedRequestState::Claimed { .. })
+            ) {
+                inner.multiplexed_requests.remove(&key);
+                true
+            } else if inner.multiplexed_retired && inner.multiplexed_requests.get(&key).is_none()
+            {
+                true
+            } else {
+                false
+            };
+            let remove_node = completed
+                && inner.multiplexed_requests.is_empty()
+                && inner.multiplexed_claims.is_empty()
+                && inner.active_inc_refs == 0
+                && inner.strong.count == 0
+                && inner.weak.count == 0
+                && !inner.strong.has_count
+                && !inner.weak.has_count;
+            (completed, remove_node)
+        };
+        if completed {
+            guard.multiplexed_reply_bytes -= reply_bytes;
+        }
+        if remove_node {
+            guard.remove_node(self.ptr);
+        }
     }
 
     pub(crate) fn add_death(
@@ -541,7 +967,99 @@ impl Node {
         Ok(())
     }
 
+    pub(crate) fn retire_multiplexed_node(&self, reason: u32) {
+        let mut guard = self.owner.inner.lock();
+        let reserved_bytes = {
+            let inner = self.inner.access_mut(&mut guard);
+            inner.multiplexed_retired = true;
+            let mut reserved_bytes = 0;
+            let mut sequence = inner.next_multiplexed_terminal;
+            for request in inner.multiplexed_requests.values_mut() {
+                let bytes = match request.state {
+                    MultiplexedRequestState::Pending => Some(0),
+                    MultiplexedRequestState::ReplyReserved { bytes } => Some(bytes),
+                    _ => None,
+                };
+                if let Some(bytes) = bytes {
+                    reserved_bytes += bytes;
+                    sequence = sequence.wrapping_add(1);
+                    request.state = MultiplexedRequestState::Ready {
+                        sequence,
+                        terminal: MultiplexedTerminal::Error { reason, error: 0 },
+                    };
+                }
+            }
+            inner.next_multiplexed_terminal = sequence;
+            reserved_bytes
+        };
+        guard.multiplexed_reply_bytes -= reserved_bytes;
+        drop(guard);
+        self.owner
+            .invalidate_multiplexed_reply_tokens_for_node(self.global_id());
+        loop {
+            let work = {
+                let mut guard = self.owner.inner.lock();
+                self.inner.access_mut(&mut guard).oneway_todo.pop_front()
+            };
+            let Some(work) = work else {
+                break;
+            };
+            work.into_arc().cancel();
+        }
+        self.dispatch_multiplexed_claims();
+        let mut guard = self.owner.inner.lock();
+        let reply_bytes = {
+            let inner = self.inner.access_mut(&mut guard);
+            let reply_bytes = inner
+                .multiplexed_requests
+                .values()
+                .map(|request| match &request.state {
+                    MultiplexedRequestState::Ready { terminal, .. } => terminal.reply_bytes(),
+                    MultiplexedRequestState::ReplyReserved { bytes } => *bytes,
+                    // Queued terminal work releases its charge when consumed or canceled.
+                    MultiplexedRequestState::Claimed { .. } => 0,
+                    MultiplexedRequestState::Pending => 0,
+                })
+                .sum::<usize>();
+            inner.multiplexed_requests = RBTree::new();
+            reply_bytes
+        };
+        guard.multiplexed_reply_bytes -= reply_bytes;
+        drop(guard);
+        // Recipient teardown may remove a node registration concurrently, so
+        // keep removals on the original list head rather than moving it out.
+        loop {
+            let claim = {
+                let mut guard = self.owner.inner.lock();
+                self.inner
+                    .access_mut(&mut guard)
+                    .multiplexed_claims
+                    .pop_front()
+            };
+            let Some(claim) = claim else {
+                break;
+            };
+            let claim = claim.into_arc();
+            claim.recipient.remove_multiplexed_claim(&claim);
+        }
+        let mut guard = self.owner.inner.lock();
+        let remove_node = {
+            let inner = self.inner.access_mut(&mut guard);
+            inner.multiplexed_requests.is_empty()
+                && inner.multiplexed_claims.is_empty()
+                && inner.active_inc_refs == 0
+                && inner.strong.count == 0
+                && inner.weak.count == 0
+                && !inner.strong.has_count
+                && !inner.weak.has_count
+        };
+        if remove_node {
+            guard.remove_node(self.ptr);
+        }
+    }
+
     pub(crate) fn release(&self) {
+        self.retire_multiplexed_node(BINDER_MULTIPLEXED_REPLY_DEAD);
         let mut guard = self.owner.inner.lock();
         while let Some(work) = self.inner.access_mut(&mut guard).oneway_todo.pop_front() {
             drop(guard);
@@ -564,6 +1082,10 @@ impl Node {
         }
 
         let inner = self.inner.access_mut(&mut guard);
+        if inner.multiplexed_retired {
+            inner.has_oneway_transaction = false;
+            return;
+        }
 
         let transaction = inner.oneway_todo.pop_front();
         inner.has_oneway_transaction = transaction.is_some();
@@ -632,7 +1154,9 @@ impl Node {
         if should_drop_strong {
             inner.strong.has_count = false;
         }
-        if no_active_inc_refs && !weak {
+        let keep_for_multiplexed_state =
+            !inner.multiplexed_requests.is_empty() || !inner.multiplexed_claims.is_empty();
+        if no_active_inc_refs && !weak && !keep_for_multiplexed_state {
             // Remove the node if there are no references to it.
             guard.remove_node(self.ptr);
         }
@@ -748,6 +1272,198 @@ impl DeliverToRead for Node {
             self.cookie,
         );
         Ok(())
+    }
+}
+
+#[pin_data(PinnedDrop)]
+pub(crate) struct MultiplexedClaimWork {
+    node: DArc<Node>,
+    recipient: Arc<Process>,
+    request_key: Atomic<u64>,
+    request_id: Atomic<u64>,
+    claim_id: u64,
+    #[pin]
+    terminal: SpinLock<Option<MultiplexedTerminal>>,
+    #[pin]
+    links_track: AtomicTracker,
+    #[pin]
+    node_links: ListLinks<1>,
+    #[pin]
+    node_links_track: AtomicTracker<1>,
+    #[pin]
+    recipient_links: ListLinks<2>,
+    #[pin]
+    recipient_links_track: AtomicTracker<2>,
+}
+
+impl MultiplexedClaimWork {
+    fn try_new(node: DArc<Node>, recipient: Arc<Process>, claim_id: u64) -> Result<DArc<Self>> {
+        DTRWrap::arc_pin_init(pin_init!(Self {
+            node,
+            recipient,
+            request_key: Atomic::new(0),
+            request_id: Atomic::new(0),
+            claim_id,
+            terminal <- kernel::new_spinlock!(None, "MultiplexedClaimWork::terminal"),
+            links_track <- AtomicTracker::new(),
+            node_links <- ListLinks::new(),
+            node_links_track <- AtomicTracker::new(),
+            recipient_links <- ListLinks::new(),
+            recipient_links_track <- AtomicTracker::new(),
+        }))
+        .map(ListArc::into_arc)
+    }
+
+    fn set_claim(&self, key: u64, request_id: u64, terminal: MultiplexedTerminal) {
+        self.request_key.store(key, Relaxed);
+        self.request_id.store(request_id, Relaxed);
+        *self.terminal.lock() = Some(terminal);
+    }
+
+    fn restore(&self, terminal: MultiplexedTerminal) {
+        self.node
+            .requeue_multiplexed_terminal(self.request_key.load(Relaxed), terminal);
+        self.node.dispatch_multiplexed_claims();
+    }
+
+    pub(crate) fn cancel_pending(self: &DArc<Self>) {
+        self.node.cancel_multiplexed_claim(self);
+    }
+}
+
+impl DeliverToRead for MultiplexedClaimWork {
+    fn required_read_size(&self) -> usize {
+        mem::size_of::<u32>() + mem::size_of::<BinderMultiplexedReplyReceived>()
+    }
+
+    fn do_work(
+        self: DArc<Self>,
+        thread: &Thread,
+        writer: &mut BinderReturnWriter<'_>,
+    ) -> Result<bool> {
+        let terminal = self.terminal.lock().take().ok_or(ESRCH)?;
+        let reply_bytes = terminal.reply_bytes();
+        let request_id = self.request_id.load(Relaxed);
+        let ret = (|| -> Result {
+            match &terminal {
+                MultiplexedTerminal::Error { reason, error } => {
+                    let status = BinderMultiplexedReplyError::new(
+                        request_id,
+                        self.claim_id,
+                        *reason,
+                        *error,
+                    );
+                    writer.write_code(BR_REPLY_MULTIPLEXED_ERROR)?;
+                    writer.write_payload(&status)
+                }
+                MultiplexedTerminal::Reply(reply) => {
+                    let mut info = TransactionInfo::zeroed();
+                    info.from_pid = thread.process.task.pid();
+                    info.data_size = reply.data.len();
+                    info.flags = reply.flags;
+                    let mut alloc = thread
+                        .process
+                        .buffer_alloc(super::next_debug_id(), reply.data.len(), &mut info)
+                        .map_err(|err| err.source.unwrap_or(EINVAL))?
+                        .success();
+                    alloc.write(0, &reply.data[..])?;
+                    if reply.flags & TF_CLEAR_BUF != 0 {
+                        alloc.set_info_clear_on_drop();
+                    }
+
+                    let mut out = BinderMultiplexedReplyReceived::default();
+                    let tr = out.tr_data();
+                    tr.code = reply.code;
+                    tr.flags = reply.flags;
+                    tr.data_size = reply.data.len() as _;
+                    tr.data.ptr.buffer = alloc.ptr as _;
+                    tr.sender_euid = reply.sender_euid.into_uid_in_current_ns();
+                    out.request_id = request_id;
+                    out.claim_id = self.claim_id;
+                    writer.write_code(BR_REPLY_MULTIPLEXED)?;
+                    writer.write_payload(&out)?;
+                    alloc.keep_alive();
+                    Ok(())
+                }
+            }
+        })();
+
+        match ret {
+            Ok(()) => {
+                self.node
+                    .complete_multiplexed_claim(self.request_key.load(Relaxed), reply_bytes);
+                Ok(false)
+            }
+            Err(err) => {
+                self.restore(terminal);
+                Err(err)
+            }
+        }
+    }
+
+    fn cancel(self: DArc<Self>) {
+        if let Some(terminal) = self.terminal.lock().take() {
+            self.restore(terminal);
+        }
+    }
+
+    fn should_sync_wakeup(&self) -> bool {
+        true
+    }
+
+    fn debug_print(&self, m: &SeqFile, prefix: &str, _tprefix: &str) -> Result<()> {
+        seq_print!(
+            m,
+            "{}multiplexed claim {}\n",
+            prefix,
+            self.request_id.load(Relaxed)
+        );
+        Ok(())
+    }
+}
+
+#[pinned_drop]
+impl PinnedDrop for MultiplexedClaimWork {
+    fn drop(self: Pin<&mut Self>) {
+        if let Some(terminal) = self.terminal.lock().take() {
+            self.restore(terminal);
+        }
+    }
+}
+
+kernel::list::impl_list_arc_safe! {
+    impl ListArcSafe<0> for MultiplexedClaimWork {
+        tracked_by links_track: AtomicTracker;
+    }
+}
+
+kernel::list::impl_list_item! {
+    impl ListItem<0> for DTRWrap<MultiplexedClaimWork> {
+        using ListLinks { self.links.inner };
+    }
+}
+
+kernel::list::impl_list_arc_safe! {
+    impl ListArcSafe<1> for MultiplexedClaimWork {
+        tracked_by node_links_track: AtomicTracker<1>;
+    }
+    impl ListArcSafe<1> for DTRWrap<MultiplexedClaimWork> {
+        tracked_by wrapped: MultiplexedClaimWork;
+    }
+    impl ListArcSafe<2> for MultiplexedClaimWork {
+        tracked_by recipient_links_track: AtomicTracker<2>;
+    }
+    impl ListArcSafe<2> for DTRWrap<MultiplexedClaimWork> {
+        tracked_by wrapped: MultiplexedClaimWork;
+    }
+}
+
+kernel::list::impl_list_item! {
+    impl ListItem<1> for DTRWrap<MultiplexedClaimWork> {
+        using ListLinks { self.wrapped.node_links };
+    }
+    impl ListItem<2> for DTRWrap<MultiplexedClaimWork> {
+        using ListLinks { self.wrapped.recipient_links };
     }
 }
 

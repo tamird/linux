@@ -12,7 +12,7 @@
 //! several binder contexts have several `Process` objects. This ensures that the contexts are
 //! fully separated.
 
-use core::mem::take;
+use core::mem::{self, take};
 
 use kernel::{
     bindings,
@@ -43,12 +43,15 @@ use crate::{
     context::Context,
     defs::*,
     error::{BinderError, BinderResult},
-    node::{CouldNotDeliverCriticalIncrement, CritIncrWrapper, Node, NodeDeath, NodeRef},
+    node::{
+        CouldNotDeliverCriticalIncrement, CritIncrWrapper, MultiplexedClaimWork,
+        MultiplexedReplyPayload, Node, NodeDeath, NodeRef,
+    },
     page_range::ShrinkablePageRange,
     range_alloc::{RangeAllocator, ReserveNew, ReserveNewArgs},
     stats::BinderStats,
     thread::{PushWorkRes, Thread},
-    transaction::TransactionInfo,
+    transaction::{Transaction, TransactionInfo},
     BinderfsProcFile, DArc, DLArc, DTRWrap, DeliverToRead,
 };
 
@@ -73,6 +76,7 @@ impl Mapping {
 // bitflags for defer_work.
 const PROC_DEFER_FLUSH: u8 = 1;
 const PROC_DEFER_RELEASE: u8 = 2;
+const MAX_MULTIPLEXED_REPLY_TOKENS: usize = 1024;
 
 #[derive(Copy, Clone)]
 pub(crate) enum IsFrozen {
@@ -112,6 +116,10 @@ pub(crate) struct ProcessInner {
     mapping: Option<Mapping>,
     work: List<DTRWrap<dyn DeliverToRead>>,
     delivered_deaths: List<DTRWrap<NodeDeath>, 2>,
+    pub(crate) pending_multiplexed_claims: List<DTRWrap<MultiplexedClaimWork>, 2>,
+    multiplexed_reply_tokens: RBTree<u64, MultiplexedReplyTokenState>,
+    next_multiplexed_reply_token: u64,
+    pub(crate) multiplexed_reply_bytes: usize,
 
     /// The number of requested threads that haven't registered yet.
     requested_thread_count: u32,
@@ -148,6 +156,10 @@ impl ProcessInner {
             nodes: RBTree::new(),
             work: List::new(),
             delivered_deaths: List::new(),
+            pending_multiplexed_claims: List::new(),
+            multiplexed_reply_tokens: RBTree::new(),
+            next_multiplexed_reply_token: 0,
+            multiplexed_reply_bytes: 0,
             requested_thread_count: 0,
             max_threads: 0,
             started_thread_count: 0,
@@ -322,7 +334,7 @@ impl ProcessInner {
     }
 
     fn txns_pending_locked(&self) -> bool {
-        if self.outstanding_txns > 0 {
+        if self.outstanding_txns > 0 || !self.multiplexed_reply_tokens.is_empty() {
             return true;
         }
         for thread in self.threads.values() {
@@ -332,6 +344,12 @@ impl ProcessInner {
         }
         false
     }
+}
+
+pub(crate) enum MultiplexedReplyTokenState {
+    InFlight(DArc<Transaction>),
+    ActiveMultiplexed { node: DArc<Node>, key: u64 },
+    ActiveOrdinary(DArc<Transaction>),
 }
 
 /// Used to keep track of a node that this process has a handle to.
@@ -556,6 +574,11 @@ impl Process {
             "  outstanding transactions: {}\n",
             inner.outstanding_txns
         );
+        seq_print!(
+            m,
+            "  multiplexed reply tokens: {}\n",
+            inner.multiplexed_reply_tokens.iter().count()
+        );
         seq_print!(m, "  nodes: {}\n", inner.nodes.iter().count());
         drop(inner);
 
@@ -655,8 +678,16 @@ impl Process {
     }
 
     /// Attempts to fetch a work item from the process queue.
-    pub(crate) fn get_work(&self) -> Option<DLArc<dyn DeliverToRead>> {
-        self.inner.lock().work.pop_front()
+    pub(crate) fn get_work(&self, available: usize) -> Result<Option<DLArc<dyn DeliverToRead>>> {
+        let mut inner = self.inner.lock();
+        let mut cursor = inner.work.cursor_front();
+        let Some(work) = cursor.peek_next() else {
+            return Ok(None);
+        };
+        if work.required_read_size() > available {
+            return Err(ENOSPC);
+        }
+        Ok(Some(work.remove()))
     }
 
     /// Attempts to fetch a work item from the process queue. If none is available, it registers the
@@ -668,11 +699,18 @@ impl Process {
     pub(crate) fn get_work_or_register<'a>(
         &'a self,
         thread: &'a Arc<Thread>,
+        available: usize,
     ) -> GetWorkOrRegister<'a> {
         let mut inner = self.inner.lock();
         // Try to get work from the process queue.
-        if let Some(work) = inner.work.pop_front() {
-            return GetWorkOrRegister::Work(work);
+        {
+            let mut cursor = inner.work.cursor_front();
+            if let Some(work) = cursor.peek_next() {
+                if work.required_read_size() > available {
+                    return GetWorkOrRegister::BufferTooSmall;
+                }
+                return GetWorkOrRegister::Work(work.remove());
+            }
         }
 
         // Register the thread as ready.
@@ -723,6 +761,208 @@ impl Process {
                 Err(err)
             }
         }
+    }
+
+    pub(crate) fn remove_multiplexed_claim(&self, claim: &DArc<MultiplexedClaimWork>) {
+        let removed = {
+            let mut inner = self.inner.lock();
+            // SAFETY: A multiplexed claim is inserted only in its recipient's pending-claim list.
+            unsafe { inner.pending_multiplexed_claims.remove(claim) }
+        };
+        drop(removed);
+    }
+
+    pub(crate) fn invalidate_multiplexed_reply_tokens_for_node(&self, node_id: usize) {
+        loop {
+            let removed = {
+                let mut inner = self.inner.lock();
+                let token = inner
+                    .multiplexed_reply_tokens
+                    .iter()
+                    .find_map(|(token, pending)| {
+                        let matches = match pending {
+                            MultiplexedReplyTokenState::InFlight(transaction) => transaction
+                                .multiplexed_delivery_node()
+                                .is_some_and(|node| node.global_id() == node_id),
+                            MultiplexedReplyTokenState::ActiveMultiplexed { node, .. } => {
+                                node.global_id() == node_id
+                            }
+                            MultiplexedReplyTokenState::ActiveOrdinary(transaction) => transaction
+                                .multiplexed_delivery_node()
+                                .is_some_and(|node| node.global_id() == node_id),
+                        };
+                        matches.then_some(*token)
+                    });
+                token.and_then(|token| inner.multiplexed_reply_tokens.remove(&token))
+            };
+            let Some(removed) = removed else {
+                return;
+            };
+            match removed {
+                MultiplexedReplyTokenState::InFlight(transaction)
+                    if transaction.multiplexed_request_key().is_none() =>
+                {
+                    transaction.from.deliver_reply(Err(BR_DEAD_REPLY), &transaction);
+                }
+                MultiplexedReplyTokenState::ActiveOrdinary(transaction) => {
+                    transaction.from.deliver_reply(Err(BR_DEAD_REPLY), &transaction);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    pub(crate) fn reserve_multiplexed_reply_token(
+        &self,
+        transaction: &DArc<Transaction>,
+    ) -> Result<u64> {
+        let reservation = RBTreeNodeReservation::new(GFP_KERNEL)?;
+        let mut inner = self.inner.lock();
+        if inner.is_dead {
+            return Err(ESRCH);
+        }
+        if transaction.is_multiplexed_cancelled() {
+            return Err(ESRCH);
+        }
+        let Some(node) = transaction.multiplexed_delivery_node() else {
+            return Err(ESRCH);
+        };
+        if let Some(key) = transaction.multiplexed_request_key() {
+            if !node.can_issue_multiplexed_reply(key, &mut inner) {
+                return Err(ESRCH);
+            }
+        } else if node.is_multiplexed_retired(&inner) {
+            return Err(ESRCH);
+        }
+        if inner.multiplexed_reply_tokens.iter().count() >= MAX_MULTIPLEXED_REPLY_TOKENS {
+            return Err(ENOSPC);
+        }
+        let token = inner
+            .next_multiplexed_reply_token
+            .checked_add(1)
+            .ok_or(ENOSPC)?;
+        inner.next_multiplexed_reply_token = token;
+        transaction.set_multiplexed_reply_token(token);
+        inner.multiplexed_reply_tokens.insert(reservation.into_node(
+            token,
+            MultiplexedReplyTokenState::InFlight(transaction.clone()),
+        ));
+        Ok(token)
+    }
+
+    pub(crate) fn activate_multiplexed_reply_token(
+        &self,
+        token: u64,
+        transaction: &DArc<Transaction>,
+    ) -> bool {
+        let Some(node) = transaction.multiplexed_delivery_node() else {
+            return false;
+        };
+        let active = if let Some(key) = transaction.multiplexed_request_key() {
+            MultiplexedReplyTokenState::ActiveMultiplexed { node, key }
+        } else {
+            MultiplexedReplyTokenState::ActiveOrdinary(transaction.clone())
+        };
+        let removed = {
+            let mut inner = self.inner.lock();
+            let Some(pending) = inner.multiplexed_reply_tokens.get_mut(&token) else {
+                return false;
+            };
+            match pending {
+                MultiplexedReplyTokenState::InFlight(current)
+                    if Arc::ptr_eq(current, transaction)
+                        && !transaction.is_multiplexed_cancelled() =>
+                {
+                    let old = mem::replace(pending, active);
+                    drop(inner);
+                    drop(old);
+                    return true;
+                }
+                _ => inner.multiplexed_reply_tokens.remove(&token),
+            }
+        };
+        drop(removed);
+        false
+    }
+
+    pub(crate) fn reserve_multiplexed_reply_payload(&self, token: u64, size: usize) -> Result {
+        let mut inner = self.inner.lock();
+        let (node, key) = match inner.multiplexed_reply_tokens.get(&token) {
+            Some(MultiplexedReplyTokenState::ActiveMultiplexed { node, key }) => {
+                (node.clone(), *key)
+            }
+            _ => return Err(EINVAL),
+        };
+        node.reserve_multiplexed_reply_payload(key, size, &mut inner)
+    }
+
+    pub(crate) fn cancel_multiplexed_reply_payload(&self, token: u64) {
+        let mut inner = self.inner.lock();
+        let (node, key) = match inner.multiplexed_reply_tokens.get(&token) {
+            Some(MultiplexedReplyTokenState::ActiveMultiplexed { node, key }) => {
+                (node.clone(), *key)
+            }
+            _ => return,
+        };
+        node.cancel_multiplexed_reply_payload(key, &mut inner);
+    }
+
+    pub(crate) fn submit_multiplexed_reply(
+        &self,
+        token: u64,
+        reply: MultiplexedReplyPayload,
+    ) -> Result {
+        let (removed, node) = {
+            let mut inner = self.inner.lock();
+            let (node, key) = match inner.multiplexed_reply_tokens.get(&token) {
+                Some(MultiplexedReplyTokenState::ActiveMultiplexed { node, key }) => {
+                    (node.clone(), *key)
+                }
+                _ => return Err(EINVAL),
+            };
+            node.queue_multiplexed_reply(key, reply, &mut inner)?;
+            (inner.multiplexed_reply_tokens.remove(&token).unwrap(), node)
+        };
+        drop(removed);
+        node.dispatch_multiplexed_claims();
+        Ok(())
+    }
+
+    pub(crate) fn take_ordinary_multiplexed_reply(&self, token: u64) -> Option<DArc<Transaction>> {
+        let mut inner = self.inner.lock();
+        let transaction = match inner.multiplexed_reply_tokens.get(&token) {
+            Some(MultiplexedReplyTokenState::ActiveOrdinary(transaction)) => transaction,
+            _ => return None,
+        };
+        let node = transaction.multiplexed_delivery_node()?;
+        if node.is_multiplexed_retired(&inner) {
+            return None;
+        }
+        match inner.multiplexed_reply_tokens.remove(&token).unwrap() {
+            MultiplexedReplyTokenState::ActiveOrdinary(transaction) => Some(transaction),
+            _ => unreachable!(),
+        }
+    }
+
+    pub(crate) fn cancel_multiplexed_reply_token(&self, transaction: &DArc<Transaction>) {
+        let removed = {
+            let mut inner = self.inner.lock();
+            transaction.set_multiplexed_cancelled();
+            let token = transaction.multiplexed_reply_token();
+            if token == 0 {
+                return;
+            }
+            let Some(MultiplexedReplyTokenState::InFlight(pending)) =
+                inner.multiplexed_reply_tokens.get(&token)
+            else {
+                return;
+            };
+            if !Arc::ptr_eq(pending, transaction) {
+                return;
+            }
+            inner.multiplexed_reply_tokens.remove(&token)
+        };
+        drop(removed);
     }
 
     fn set_as_manager(
@@ -997,6 +1237,21 @@ impl Process {
                 let _ = inner.push_work(node);
             }
         }
+        Ok(())
+    }
+
+    pub(crate) fn retire_multiplexed_node(&self, reader: &mut UserSliceReader) -> Result {
+        let ptr = reader.read::<u64>()?;
+        let cookie = reader.read::<u64>()?;
+        let node = self
+            .inner
+            .lock()
+            .get_existing_node(ptr, cookie)?
+            .ok_or(ESRCH)?;
+        if !node.uses_multiplexed_delivery() {
+            return Err(ENOTSUPP);
+        }
+        node.retire_multiplexed_node(BINDER_MULTIPLEXED_REPLY_SHUTDOWN);
         Ok(())
     }
 
@@ -1321,14 +1576,43 @@ impl Process {
     }
 
     fn deferred_release(self: Arc<Self>) {
-        let is_manager = {
+        let (is_manager, multiplexed_reply_tokens) = {
             let mut inner = self.inner.lock();
             inner.is_dead = true;
             inner.is_frozen = IsFrozen::No;
             inner.sync_recv = false;
             inner.async_recv = false;
-            inner.is_manager
+            (inner.is_manager, take(&mut inner.multiplexed_reply_tokens))
         };
+
+        // Pairing may remove a recipient registration concurrently, so keep
+        // removals on the original list head rather than moving the list out.
+        loop {
+            let claim = self.inner.lock().pending_multiplexed_claims.pop_front();
+            let Some(claim) = claim else {
+                break;
+            };
+            claim.into_arc().cancel_pending();
+        }
+
+        for pending in multiplexed_reply_tokens.values() {
+            match pending {
+                MultiplexedReplyTokenState::InFlight(transaction) => {
+                    if transaction.multiplexed_request_key().is_some() {
+                        transaction.fail_multiplexed_request(BINDER_MULTIPLEXED_REPLY_DEAD, 0);
+                    } else {
+                        transaction.from.deliver_reply(Err(BR_DEAD_REPLY), transaction);
+                    }
+                }
+                MultiplexedReplyTokenState::ActiveMultiplexed { node, key } => {
+                    node.fail_multiplexed_request(*key, BINDER_MULTIPLEXED_REPLY_DEAD, 0)
+                }
+                MultiplexedReplyTokenState::ActiveOrdinary(transaction) => {
+                    transaction.from.deliver_reply(Err(BR_DEAD_REPLY), transaction)
+                }
+            }
+        }
+        drop(multiplexed_reply_tokens);
 
         if is_manager {
             self.ctx.unset_manager_node();
@@ -1395,7 +1679,7 @@ impl Process {
         }
 
         // Cancel all pending work items.
-        while let Some(work) = self.get_work() {
+        while let Ok(Some(work)) = self.get_work(usize::MAX) {
             work.into_arc().cancel();
         }
 
@@ -1753,5 +2037,6 @@ impl Drop for WithNodes<'_> {
 
 pub(crate) enum GetWorkOrRegister<'a> {
     Work(DLArc<dyn DeliverToRead>),
+    BufferTooSmall,
     Register(Registration<'a>),
 }

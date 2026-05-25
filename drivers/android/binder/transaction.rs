@@ -7,6 +7,7 @@ use kernel::{
     seq_file::SeqFile,
     seq_print,
     sync::atomic::{ordering::Relaxed, Atomic},
+    sync::lock::{spinlock::SpinLockBackend, Guard},
     sync::{Arc, SpinLock},
     task::{Kuid, Pid},
     time::{Instant, Monotonic},
@@ -23,6 +24,8 @@ use crate::{
     thread::{PushWorkRes, Thread},
     BinderReturnWriter, DArc, DLArc, DTRWrap, DeliverToRead,
 };
+
+use core::mem::size_of;
 
 #[derive(Zeroable)]
 pub(crate) struct TransactionInfo {
@@ -42,6 +45,11 @@ pub(crate) struct TransactionInfo {
     pub(crate) reply: u32,
     pub(crate) oneway_spam_suspect: bool,
     pub(crate) is_reply: bool,
+    pub(crate) is_multiplexed: bool,
+    pub(crate) is_multiplexed_sg_reply: bool,
+    pub(crate) request_id: u64,
+    pub(crate) multiplexed_request_key: u64,
+    pub(crate) reply_token: u64,
 }
 
 impl TransactionInfo {
@@ -79,6 +87,10 @@ pub(crate) struct Transaction {
     data_address: usize,
     sender_euid: Kuid,
     txn_security_ctx_off: Option<usize>,
+    multiplexed_request_id: Option<u64>,
+    multiplexed_request_key: Option<u64>,
+    multiplexed_reply_token: Atomic<u64>,
+    multiplexed_cancelled: Atomic<bool>,
     start_time: Instant<Monotonic>,
 }
 
@@ -142,6 +154,10 @@ impl Transaction {
             allocation <- kernel::new_spinlock!(Some(alloc.success()), "Transaction::new"),
             is_outstanding: Atomic::new(false),
             txn_security_ctx_off,
+            multiplexed_request_id: info.is_multiplexed.then_some(info.request_id),
+            multiplexed_request_key: info.is_multiplexed.then_some(info.multiplexed_request_key),
+            multiplexed_reply_token: Atomic::new(0),
+            multiplexed_cancelled: Atomic::new(false),
             start_time: Instant::now(),
         }))?)
     }
@@ -179,6 +195,10 @@ impl Transaction {
             allocation <- kernel::new_spinlock!(Some(alloc.success()), "Transaction::new"),
             is_outstanding: Atomic::new(false),
             txn_security_ctx_off: None,
+            multiplexed_request_id: None,
+            multiplexed_request_key: None,
+            multiplexed_reply_token: Atomic::new(0),
+            multiplexed_cancelled: Atomic::new(false),
             start_time: Instant::now(),
         }))?)
     }
@@ -244,6 +264,58 @@ impl Transaction {
         None
     }
 
+    pub(crate) fn set_multiplexed_reply_token(&self, token: u64) {
+        self.multiplexed_reply_token.store(token, Relaxed);
+    }
+
+    pub(crate) fn multiplexed_reply_token(&self) -> u64 {
+        self.multiplexed_reply_token.load(Relaxed)
+    }
+
+    pub(crate) fn set_multiplexed_cancelled(&self) {
+        self.multiplexed_cancelled.store(true, Relaxed);
+    }
+
+    pub(crate) fn is_multiplexed_cancelled(&self) -> bool {
+        self.multiplexed_cancelled.load(Relaxed)
+    }
+
+    pub(crate) fn multiplexed_request_key(&self) -> Option<u64> {
+        self.multiplexed_request_key
+    }
+
+    fn uses_multiplexed_delivery(&self) -> bool {
+        self.flags & TF_ONE_WAY == 0
+            && self
+                .target_node
+                .as_ref()
+                .is_some_and(|node| node.uses_multiplexed_delivery())
+    }
+
+    pub(crate) fn multiplexed_delivery_node(&self) -> Option<DArc<Node>> {
+        self.uses_multiplexed_delivery()
+            .then(|| self.target_node.as_ref().unwrap().clone())
+    }
+
+    fn is_fenced_by_multiplexed_retirement(
+        &self,
+        guard: &Guard<'_, ProcessInner, SpinLockBackend>,
+    ) -> bool {
+        self.target_node
+            .as_ref()
+            .is_some_and(|node| node.is_multiplexed_retired(guard))
+    }
+
+    pub(crate) fn cancel_multiplexed_reply_token(self: &DArc<Self>) {
+        self.to.cancel_multiplexed_reply_token(self);
+    }
+
+    pub(crate) fn fail_multiplexed_request(&self, reason: u32, error: i32) {
+        if let (Some(node), Some(key)) = (self.target_node.as_ref(), self.multiplexed_request_key) {
+            node.fail_multiplexed_request(key, reason, error);
+        }
+    }
+
     pub(crate) fn set_outstanding(&self, to_process: &mut ProcessInner) {
         // No race because this method is only called once.
         if !self.is_outstanding.load(Relaxed) {
@@ -275,6 +347,10 @@ impl Transaction {
         let oneway = self.flags & TF_ONE_WAY != 0;
         let process = self.to.clone();
         let mut process_inner = process.inner.lock();
+
+        if self.is_fenced_by_multiplexed_retirement(&process_inner) {
+            return Err(BinderError::new_dead());
+        }
 
         self.set_outstanding(&mut process_inner);
 
@@ -377,13 +453,35 @@ impl Transaction {
 }
 
 impl DeliverToRead for Transaction {
+    fn required_read_size(&self) -> usize {
+        if !self.uses_multiplexed_delivery() {
+            return size_of::<BinderTransactionDataSecctx>() + size_of::<u32>();
+        }
+        let payload_size = if self.txn_security_ctx_off.is_some() {
+            size_of::<BinderMultiplexedTransactionSecctxReceived>()
+        } else {
+            size_of::<BinderMultiplexedTransactionReceived>()
+        };
+        size_of::<u32>() + payload_size
+    }
+
     fn do_work(
         self: DArc<Self>,
         thread: &Thread,
         writer: &mut BinderReturnWriter<'_>,
     ) -> Result<bool> {
+        if self.is_fenced_by_multiplexed_retirement(&self.to.inner.lock()) {
+            self.cancel();
+            return Ok(true);
+        }
+
         let send_failed_reply = ScopeGuard::new(|| {
-            if self.target_node.is_some() && self.flags & TF_ONE_WAY == 0 {
+            if self.uses_multiplexed_delivery() {
+                self.cancel_multiplexed_reply_token();
+            }
+            if self.target_node.is_some() && self.multiplexed_request_id.is_some() {
+                self.fail_multiplexed_request(BINDER_MULTIPLEXED_REPLY_FAILED, 0);
+            } else if self.target_node.is_some() && self.flags & TF_ONE_WAY == 0 {
                 let reply = Err(BR_FAILED_REPLY);
                 self.from.deliver_reply(reply, &self);
             }
@@ -419,21 +517,74 @@ impl DeliverToRead for Transaction {
             // Not a reply and not one-way.
             tr.sender_pid = self.from.process.pid_in_current_ns();
         }
-        let code = if self.target_node.is_none() {
-            BR_REPLY
-        } else if self.txn_security_ctx_off.is_some() {
-            BR_TRANSACTION_SEC_CTX
-        } else {
-            BR_TRANSACTION
-        };
+        let is_request = self.target_node.is_some();
+        let is_multiplexed = self.uses_multiplexed_delivery();
+        let mut reserved_token = None;
 
-        // Write the transaction code and data to the user buffer.
-        writer.write_code(code)?;
-        if let Some(off) = self.txn_security_ctx_off {
-            tr_sec.secctx = (self.data_address + off) as u64;
-            writer.write_payload(&tr_sec)?;
+        if is_request && is_multiplexed {
+            let token = match self.to.reserve_multiplexed_reply_token(&self) {
+                Ok(token) => token,
+                Err(err) => {
+                    send_failed_reply.dismiss();
+                    if self.multiplexed_request_id.is_some() {
+                        let reason = if err == ENOSPC {
+                            BINDER_MULTIPLEXED_REPLY_RESOURCE_EXHAUSTED
+                        } else {
+                            BINDER_MULTIPLEXED_REPLY_FAILED
+                        };
+                        self.fail_multiplexed_request(reason, err.to_errno());
+                    } else {
+                        let reply = if err == ESRCH {
+                            BR_DEAD_REPLY
+                        } else {
+                            BR_FAILED_REPLY
+                        };
+                        self.from.deliver_reply(Err(reply), &self);
+                    }
+                    self.drop_outstanding_txn();
+                    return Ok(true);
+                }
+            };
+            reserved_token = Some(token);
+
+            if let Some(off) = self.txn_security_ctx_off {
+                let mut out = BinderMultiplexedTransactionSecctxReceived::default();
+                let out_tr = out.tr_data();
+                *out_tr.tr_data() = *tr;
+                out_tr.request_id = self.multiplexed_request_id.unwrap_or(0);
+                out_tr.reply_token = token;
+                if self.multiplexed_request_id.is_none() {
+                    out_tr.delivery_flags = BINDER_MULTIPLEXED_DELIVERY_ORDINARY;
+                }
+                out.secctx = (self.data_address + off) as u64;
+                writer.write_code(BR_TRANSACTION_MULTIPLEXED_SEC_CTX)?;
+                writer.write_payload(&out)?;
+            } else {
+                let mut out = BinderMultiplexedTransactionReceived::default();
+                *out.tr_data() = *tr;
+                out.request_id = self.multiplexed_request_id.unwrap_or(0);
+                out.reply_token = token;
+                if self.multiplexed_request_id.is_none() {
+                    out.delivery_flags = BINDER_MULTIPLEXED_DELIVERY_ORDINARY;
+                }
+                writer.write_code(BR_TRANSACTION_MULTIPLEXED)?;
+                writer.write_payload(&out)?;
+            }
         } else {
-            writer.write_payload(&*tr)?;
+            let code = if self.target_node.is_none() {
+                BR_REPLY
+            } else if self.txn_security_ctx_off.is_some() {
+                BR_TRANSACTION_SEC_CTX
+            } else {
+                BR_TRANSACTION
+            };
+            writer.write_code(code)?;
+            if let Some(off) = self.txn_security_ctx_off {
+                tr_sec.secctx = (self.data_address + off) as u64;
+                writer.write_payload(&tr_sec)?;
+            } else {
+                writer.write_payload(&*tr)?;
+            }
         }
 
         let mut alloc = self.allocation.lock().take().ok_or(ESRCH)?;
@@ -453,9 +604,15 @@ impl DeliverToRead for Transaction {
 
         crate::trace::trace_transaction_received(&self);
 
-        // When this is not a reply and not a oneway transaction, update `current_transaction`. If
-        // it's a reply, `current_transaction` has already been updated appropriately.
-        if self.target_node.is_some() && tr_sec.transaction_data.flags & TF_ONE_WAY == 0 {
+        if let Some(token) = reserved_token {
+            if !self.to.activate_multiplexed_reply_token(token, &self)
+                && self.multiplexed_request_id.is_none()
+            {
+                self.from.deliver_reply(Err(BR_DEAD_REPLY), &self);
+            }
+        } else if self.target_node.is_some() && tr_sec.transaction_data.flags & TF_ONE_WAY == 0 {
+            // A legacy reply updates `current_transaction` before it is delivered; a legacy
+            // request becomes the current transaction when it reaches the receiving thread.
             thread.set_current_transaction(self);
         }
 
@@ -466,8 +623,13 @@ impl DeliverToRead for Transaction {
         let allocation = self.allocation.lock().take();
         drop(allocation);
 
-        // If this is not a reply or oneway transaction, then send a dead reply.
-        if self.target_node.is_some() && self.flags & TF_ONE_WAY == 0 {
+        if self.uses_multiplexed_delivery() {
+            self.cancel_multiplexed_reply_token();
+        }
+        if self.target_node.is_some() && self.multiplexed_request_id.is_some() {
+            self.fail_multiplexed_request(BINDER_MULTIPLEXED_REPLY_DEAD, 0);
+        } else if self.target_node.is_some() && self.flags & TF_ONE_WAY == 0 {
+            // If this is not a reply or oneway transaction, then send a dead reply.
             let reply = Err(BR_DEAD_REPLY);
             self.from.deliver_reply(reply, &self);
         }

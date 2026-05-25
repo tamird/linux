@@ -85,3 +85,7 @@ Example::
 
         cat /dev/binderfs/features/oneway_spam_detection
         1
+
+The ``multiplexed_transactions`` feature indicates support for stackless
+two-way transactions with user-selected request identifiers.  The protocol is
+described in ``Documentation/userspace-api/binder.rst``.

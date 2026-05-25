@@ -27,6 +27,7 @@ use crate::{
     allocation::{Allocation, AllocationView, BinderObject, BinderObjectRef, NewAllocation},
     defs::*,
     error::BinderResult,
+    node::MultiplexedReplyPayload,
     process::{GetWorkOrRegister, Process},
     ptr_align,
     stats::GLOBAL_STATS,
@@ -298,14 +299,21 @@ impl InnerThread {
         })
     }
 
-    fn pop_work(&mut self) -> Option<DLArc<dyn DeliverToRead>> {
+    fn pop_work(&mut self, available: usize) -> Result<Option<DLArc<dyn DeliverToRead>>> {
         if !self.process_work_list {
-            return None;
+            return Ok(None);
         }
 
-        let ret = self.work_list.pop_front();
+        let mut cursor = self.work_list.cursor_front();
+        let Some(work) = cursor.peek_next() else {
+            return Ok(None);
+        };
+        if work.required_read_size() > available {
+            return Err(ENOSPC);
+        }
+        let ret = work.remove();
         self.process_work_list = !self.work_list.is_empty();
-        ret
+        Ok(Some(ret))
     }
 
     fn push_work(&mut self, work: DLArc<dyn DeliverToRead>) -> PushWorkRes {
@@ -516,24 +524,39 @@ impl Thread {
     // #[export_name] is a temporary workaround so that ps output does not become unreadable from
     // mangled symbol names.
     #[export_name = "rust_binder_waitlcl"]
-    fn get_work_local(self: &Arc<Self>, wait: bool) -> Result<Option<DLArc<dyn DeliverToRead>>> {
+    fn get_work_local(
+        self: &Arc<Self>,
+        wait: bool,
+        available: usize,
+    ) -> Result<Option<DLArc<dyn DeliverToRead>>> {
         {
             let mut inner = self.inner.lock();
             if inner.looper_need_return {
-                return Ok(inner.pop_work());
+                return match inner.pop_work(available) {
+                    Err(ENOSPC) => Ok(None),
+                    result => result,
+                };
             }
         }
 
         // Try once if the caller does not want to wait.
         if !wait {
-            return self.inner.lock().pop_work().ok_or(EAGAIN).map(Some);
+            return match self.inner.lock().pop_work(available) {
+                Ok(Some(work)) => Ok(Some(work)),
+                Ok(None) => Err(EAGAIN),
+                Err(ENOSPC) => Ok(None),
+                Err(err) => Err(err),
+            };
         }
 
         // Loop waiting only on the local queue (i.e., not registering with the process queue).
         let mut inner = self.inner.lock();
         loop {
-            if let Some(work) = inner.pop_work() {
-                return Ok(Some(work));
+            match inner.pop_work(available) {
+                Ok(Some(work)) => return Ok(Some(work)),
+                Err(ENOSPC) => return Ok(None),
+                Ok(None) => {}
+                Err(err) => return Err(err),
             }
 
             inner.looper_flags |= LOOPER_WAITING;
@@ -557,16 +580,26 @@ impl Thread {
     // #[export_name] is a temporary workaround so that ps output does not become unreadable from
     // mangled symbol names.
     #[export_name = "rust_binder_wait"]
-    fn get_work(self: &Arc<Self>, wait: bool) -> Result<Option<DLArc<dyn DeliverToRead>>> {
+    fn get_work(
+        self: &Arc<Self>,
+        wait: bool,
+        available: usize,
+    ) -> Result<Option<DLArc<dyn DeliverToRead>>> {
         // Try to get work from the thread's work queue, using only a local lock.
         {
             let mut inner = self.inner.lock();
-            if let Some(work) = inner.pop_work() {
-                return Ok(Some(work));
+            match inner.pop_work(available) {
+                Ok(Some(work)) => return Ok(Some(work)),
+                Err(ENOSPC) => return Ok(None),
+                Ok(None) => {}
+                Err(err) => return Err(err),
             }
             if inner.looper_need_return {
                 drop(inner);
-                return Ok(self.process.get_work());
+                return match self.process.get_work(available) {
+                    Err(ENOSPC) => Ok(None),
+                    result => result,
+                };
             }
         }
 
@@ -575,19 +608,28 @@ impl Thread {
         // We know nothing will have been queued directly to the thread queue because it is not in
         // a transaction and it is not in the process' ready list.
         if !wait {
-            return self.process.get_work().ok_or(EAGAIN).map(Some);
+            return match self.process.get_work(available) {
+                Ok(Some(work)) => Ok(Some(work)),
+                Ok(None) => Err(EAGAIN),
+                Err(ENOSPC) => Ok(None),
+                Err(err) => Err(err),
+            };
         }
 
         // Get work from the process queue. If none is available, atomically register as ready.
-        let reg = match self.process.get_work_or_register(self) {
+        let reg = match self.process.get_work_or_register(self, available) {
             GetWorkOrRegister::Work(work) => return Ok(Some(work)),
+            GetWorkOrRegister::BufferTooSmall => return Ok(None),
             GetWorkOrRegister::Register(reg) => reg,
         };
 
         let mut inner = self.inner.lock();
         loop {
-            if let Some(work) = inner.pop_work() {
-                return Ok(Some(work));
+            match inner.pop_work(available) {
+                Ok(Some(work)) => return Ok(Some(work)),
+                Err(ENOSPC) => return Ok(None),
+                Ok(None) => {}
+                Err(err) => return Err(err),
             }
 
             inner.looper_flags |= LOOPER_WAITING | LOOPER_WAITING_PROC;
@@ -602,10 +644,12 @@ impl Thread {
                 drop(inner);
                 drop(reg);
 
-                let res = match self.inner.lock().pop_work() {
-                    Some(work) => Ok(Some(work)),
-                    None if signal_pending => Err(EINTR),
-                    None => Ok(None),
+                let res = match self.inner.lock().pop_work(available) {
+                    Ok(Some(work)) => Ok(Some(work)),
+                    Err(ENOSPC) => Ok(None),
+                    Ok(None) if signal_pending => Err(EINTR),
+                    Ok(None) => Ok(None),
+                    Err(err) => Err(err),
                 };
                 return res;
             }
@@ -1204,13 +1248,35 @@ impl Thread {
                 reader.read::<BinderTransactionData>()?.with_buffers_size(0)
             }
             BC_TRANSACTION_SG | BC_REPLY_SG => reader.read::<BinderTransactionDataSg>()?,
+            BC_TRANSACTION_MULTIPLEXED => {
+                let td = reader.read::<BinderMultiplexedTransaction>()?;
+                info.is_multiplexed = true;
+                info.request_id = td.request_id;
+                (*td.tr_data()).with_buffers_size(0)
+            }
+            BC_REPLY_MULTIPLEXED => {
+                let td = reader.read::<BinderMultiplexedReply>()?;
+                info.is_multiplexed = true;
+                info.reply_token = td.reply_token;
+                (*td.tr_data()).with_buffers_size(0)
+            }
+            BC_REPLY_MULTIPLEXED_SG => {
+                let td = reader.read::<BinderMultiplexedReplySg>()?;
+                info.is_multiplexed = true;
+                info.is_multiplexed_sg_reply = true;
+                info.reply_token = td.reply_token;
+                *td.tr_data()
+            }
             _ => return Err(EINVAL),
         };
 
         // SAFETY: Above `read` call initializes all bytes, so this union read is ok.
         let trd_data_ptr = unsafe { &td.transaction_data.data.ptr };
 
-        info.is_reply = matches!(cmd, BC_REPLY | BC_REPLY_SG);
+        info.is_reply = matches!(
+            cmd,
+            BC_REPLY | BC_REPLY_SG | BC_REPLY_MULTIPLEXED | BC_REPLY_MULTIPLEXED_SG
+        );
         info.from_pid = self.process.task.pid();
         info.from_tid = self.id;
         info.code = td.transaction_data.code;
@@ -1229,6 +1295,14 @@ impl Thread {
     fn transaction(self: &Arc<Self>, cmd: u32, reader: &mut UserSliceReader) -> Result<()> {
         let mut info = TransactionInfo::zeroed();
         self.read_transaction_info(cmd, reader, &mut info)?;
+
+        if info.is_multiplexed {
+            return if info.is_reply {
+                self.multiplexed_reply_inner(&mut info)
+            } else {
+                self.multiplexed_transaction_inner(&mut info)
+            };
+        }
 
         let ret = if info.is_reply {
             self.reply_inner(&mut info)
@@ -1261,6 +1335,38 @@ impl Thread {
                     info.to_pid
                 );
             }
+        }
+
+        Ok(())
+    }
+
+    fn multiplexed_transaction_inner(self: &Arc<Self>, info: &mut TransactionInfo) -> Result<()> {
+        if info.flags & (TF_ONE_WAY | TF_UPDATE_TXN) != 0 {
+            return Err(EINVAL);
+        }
+
+        let node_ref = self
+            .process
+            .get_transaction_node(info.target_handle)
+            .map_err(|err| err.source.unwrap_or(ESRCH))?;
+        info.to_pid = node_ref.node.owner.task.pid();
+        if !node_ref.node.uses_multiplexed_delivery() {
+            return Err(ENOTSUPP);
+        }
+        security::binder_transaction(&self.process.cred, &node_ref.node.owner.cred)?;
+        let node = node_ref.node.clone();
+        info.multiplexed_request_key = node.accept_multiplexed_request(info.request_id)?;
+        let ret = Transaction::new(node_ref, None, self, info)
+            .and_then(|transaction| transaction.submit(info));
+
+        if let Err(err) = ret {
+            let reason = match err.reply {
+                BR_DEAD_REPLY => BINDER_MULTIPLEXED_REPLY_DEAD,
+                BR_FROZEN_REPLY => BINDER_MULTIPLEXED_REPLY_FROZEN,
+                _ => BINDER_MULTIPLEXED_REPLY_FAILED,
+            };
+            let error = err.source.map_or(0, |source| source.to_errno());
+            node.fail_multiplexed_request(info.multiplexed_request_key, reason, error);
         }
 
         Ok(())
@@ -1339,6 +1445,68 @@ impl Thread {
         out
     }
 
+    fn multiplexed_reply_inner(self: &Arc<Self>, info: &mut TransactionInfo) -> Result<()> {
+        if info.flags & (TF_ONE_WAY | TF_UPDATE_TXN) != 0 || info.reply_token == 0 {
+            return Err(EINVAL);
+        }
+
+        if let Some(orig) = self.process.take_ordinary_multiplexed_reply(info.reply_token) {
+            info.to_tid = orig.from.id;
+            info.to_pid = orig.from.process.task.pid();
+            let allow_fds = orig.flags & TF_ACCEPT_FDS != 0;
+            return match Transaction::new_reply(self, orig.from.process.clone(), info, allow_fds) {
+                Ok(reply) => {
+                    orig.from.deliver_reply(Ok(reply), &orig);
+                    Ok(())
+                }
+                Err(err) => {
+                    orig.from.deliver_reply(Err(BR_FAILED_REPLY), &orig);
+                    Err(err.source.unwrap_or(EINVAL))
+                }
+            };
+        }
+
+        if info.is_multiplexed_sg_reply || info.offsets_size != 0 || info.buffers_size != 0 {
+            return Err(EINVAL);
+        }
+
+        self.process
+            .reserve_multiplexed_reply_payload(info.reply_token, info.data_size)?;
+        let result = (|| -> Result {
+            let mut data = KVec::new();
+            UserSlice::new(info.data_ptr, info.data_size).read_all(&mut data, GFP_KERNEL)?;
+            self.process.submit_multiplexed_reply(
+                info.reply_token,
+                MultiplexedReplyPayload::new(info.code, info.flags, data),
+            )
+        })();
+        if result.is_err() {
+            self.process
+                .cancel_multiplexed_reply_payload(info.reply_token);
+        }
+        result
+    }
+
+    fn claim_multiplexed_reply(self: &Arc<Self>, reader: &mut UserSliceReader) -> Result<()> {
+        let claim = reader.read::<BinderMultiplexedReplyClaim>()?;
+        if claim.reserved != 0 {
+            return Err(EINVAL);
+        }
+        let node_ref = self
+            .process
+            .get_transaction_node(claim.handle)
+            .map_err(|err| err.source.unwrap_or(ESRCH))?;
+        if !node_ref.node.uses_multiplexed_delivery() {
+            return Err(ENOTSUPP);
+        }
+        security::binder_transaction(&node_ref.node.owner.cred, &self.process.cred)?;
+        node_ref
+            .node
+            .claim_multiplexed_reply(self.process.clone(), claim.claim_id)?;
+        drop(node_ref);
+        Ok(())
+    }
+
     fn oneway_transaction_inner(self: &Arc<Self>, info: &mut TransactionInfo) -> BinderResult {
         let node_ref = self.process.get_transaction_node(info.target_handle)?;
         info.to_pid = node_ref.node.owner.task.pid();
@@ -1374,9 +1542,19 @@ impl Thread {
             GLOBAL_STATS.inc_bc(cmd);
             self.process.stats.inc_bc(cmd);
             match cmd {
-                BC_TRANSACTION | BC_TRANSACTION_SG | BC_REPLY | BC_REPLY_SG => {
+                BC_TRANSACTION
+                | BC_TRANSACTION_SG
+                | BC_REPLY
+                | BC_REPLY_SG
+                | BC_TRANSACTION_MULTIPLEXED
+                | BC_REPLY_MULTIPLEXED
+                | BC_REPLY_MULTIPLEXED_SG => {
                     self.transaction(cmd, &mut reader)?;
                 }
+                BC_CLAIM_MULTIPLEXED_REPLY => self.claim_multiplexed_reply(&mut reader)?,
+                BC_RETIRE_MULTIPLEXED_NODE => self
+                    .process
+                    .retire_multiplexed_node(&mut reader)?,
                 BC_FREE_BUFFER => {
                     let buffer = self.process.buffer_get(reader.read()?);
                     if let Some(buffer) = buffer {
@@ -1451,12 +1629,6 @@ impl Thread {
 
         crate::trace::trace_wait_for_work(use_proc_queue, has_transaction, thread_todo);
 
-        let getter = if use_proc_queue {
-            Self::get_work
-        } else {
-            Self::get_work_local
-        };
-
         // Reserve some room at the beginning of the read buffer so that we can send a
         // BR_SPAWN_LOOPER if we need to.
         let mut has_noop_placeholder = false;
@@ -1471,7 +1643,12 @@ impl Thread {
         // Loop doing work while there is room in the buffer.
         let initial_len = writer.len();
         while writer.len() >= size_of::<uapi::binder_transaction_data_secctx>() + 4 {
-            match getter(self, wait && initial_len == writer.len()) {
+            let work = if use_proc_queue {
+                self.get_work(wait && initial_len == writer.len(), writer.len())
+            } else {
+                self.get_work_local(wait && initial_len == writer.len(), writer.len())
+            };
+            match work {
                 Ok(Some(work)) => match work.into_arc().do_work(self, &mut writer) {
                     Ok(true) => {}
                     Ok(false) => break,
@@ -1594,7 +1771,7 @@ impl Thread {
         self.unwind_transaction_stack();
 
         // Cancel all pending work items.
-        while let Ok(Some(work)) = self.get_work_local(false) {
+        while let Ok(Some(work)) = self.get_work_local(false, usize::MAX) {
             work.into_arc().cancel();
         }
     }

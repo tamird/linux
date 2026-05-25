@@ -38,6 +38,10 @@ pub_no_prefix!(
     BR_CLEAR_DEATH_NOTIFICATION_DONE,
     BR_FROZEN_BINDER,
     BR_CLEAR_FREEZE_NOTIFICATION_DONE,
+    BR_TRANSACTION_MULTIPLEXED,
+    BR_TRANSACTION_MULTIPLEXED_SEC_CTX,
+    BR_REPLY_MULTIPLEXED,
+    BR_REPLY_MULTIPLEXED_ERROR,
 );
 
 pub_no_prefix!(
@@ -62,12 +66,18 @@ pub_no_prefix!(
     BC_REQUEST_FREEZE_NOTIFICATION,
     BC_CLEAR_FREEZE_NOTIFICATION,
     BC_FREEZE_NOTIFICATION_DONE,
+    BC_TRANSACTION_MULTIPLEXED,
+    BC_REPLY_MULTIPLEXED,
+    BC_REPLY_MULTIPLEXED_SG,
+    BC_CLAIM_MULTIPLEXED_REPLY,
+    BC_RETIRE_MULTIPLEXED_NODE,
 );
 
 pub_no_prefix!(
     flat_binder_object_flags_,
     FLAT_BINDER_FLAG_ACCEPTS_FDS,
-    FLAT_BINDER_FLAG_TXN_SECURITY_CTX
+    FLAT_BINDER_FLAG_TXN_SECURITY_CTX,
+    FLAT_BINDER_FLAG_MULTIPLEXED_DELIVERY
 );
 
 pub_no_prefix!(
@@ -76,6 +86,20 @@ pub_no_prefix!(
     TF_ACCEPT_FDS,
     TF_CLEAR_BUF,
     TF_UPDATE_TXN
+);
+
+pub_no_prefix!(
+    binder_multiplexed_reply_error_reason_,
+    BINDER_MULTIPLEXED_REPLY_DEAD,
+    BINDER_MULTIPLEXED_REPLY_SHUTDOWN,
+    BINDER_MULTIPLEXED_REPLY_FAILED,
+    BINDER_MULTIPLEXED_REPLY_FROZEN,
+    BINDER_MULTIPLEXED_REPLY_RESOURCE_EXHAUSTED,
+);
+
+pub_no_prefix!(
+    binder_multiplexed_delivery_flags_,
+    BINDER_MULTIPLEXED_DELIVERY_ORDINARY,
 );
 
 pub(crate) use uapi::{
@@ -135,6 +159,32 @@ decl_wrapper!(
     uapi::binder_transaction_data_secctx
 );
 decl_wrapper!(BinderTransactionDataSg, uapi::binder_transaction_data_sg);
+decl_wrapper!(
+    BinderMultiplexedTransaction,
+    uapi::binder_multiplexed_transaction
+);
+decl_wrapper!(
+    BinderMultiplexedTransactionReceived,
+    uapi::binder_multiplexed_transaction_received
+);
+decl_wrapper!(
+    BinderMultiplexedTransactionSecctxReceived,
+    uapi::binder_multiplexed_transaction_secctx_received
+);
+decl_wrapper!(BinderMultiplexedReply, uapi::binder_multiplexed_reply);
+decl_wrapper!(BinderMultiplexedReplySg, uapi::binder_multiplexed_reply_sg);
+decl_wrapper!(
+    BinderMultiplexedReplyClaim,
+    uapi::binder_multiplexed_reply_claim
+);
+decl_wrapper!(
+    BinderMultiplexedReplyReceived,
+    uapi::binder_multiplexed_reply_received
+);
+decl_wrapper!(
+    BinderMultiplexedReplyError,
+    uapi::binder_multiplexed_reply_error
+);
 decl_wrapper!(BinderWriteRead, uapi::binder_write_read);
 decl_wrapper!(BinderVersion, uapi::binder_version);
 decl_wrapper!(BinderFrozenStatusInfo, uapi::binder_frozen_status_info);
@@ -168,6 +218,77 @@ impl BinderTransactionDataSecctx {
             &mut *(&mut self.transaction_data as *mut uapi::binder_transaction_data
                 as *mut BinderTransactionData)
         }
+    }
+}
+
+impl BinderMultiplexedTransaction {
+    pub(crate) fn tr_data(&self) -> &BinderTransactionData {
+        // SAFETY: Transparent wrapper is safe to transmute.
+        unsafe {
+            &*(&self.transaction_data as *const uapi::binder_transaction_data
+                as *const BinderTransactionData)
+        }
+    }
+}
+
+impl BinderMultiplexedTransactionReceived {
+    pub(crate) fn tr_data(&mut self) -> &mut BinderTransactionData {
+        // SAFETY: Transparent wrapper is safe to transmute.
+        unsafe {
+            &mut *(&mut self.transaction_data as *mut uapi::binder_transaction_data
+                as *mut BinderTransactionData)
+        }
+    }
+}
+
+impl BinderMultiplexedTransactionSecctxReceived {
+    pub(crate) fn tr_data(&mut self) -> &mut BinderMultiplexedTransactionReceived {
+        // SAFETY: Transparent wrapper is safe to transmute.
+        unsafe {
+            &mut *(&mut self.transaction as *mut uapi::binder_multiplexed_transaction_received
+                as *mut BinderMultiplexedTransactionReceived)
+        }
+    }
+}
+
+impl BinderMultiplexedReply {
+    pub(crate) fn tr_data(&self) -> &BinderTransactionData {
+        // SAFETY: Transparent wrapper is safe to transmute.
+        unsafe {
+            &*(&self.transaction_data as *const uapi::binder_transaction_data
+                as *const BinderTransactionData)
+        }
+    }
+}
+
+impl BinderMultiplexedReplySg {
+    pub(crate) fn tr_data(&self) -> &BinderTransactionDataSg {
+        // SAFETY: Transparent wrapper is safe to transmute.
+        unsafe {
+            &*(&self.transaction_data as *const uapi::binder_transaction_data_sg
+                as *const BinderTransactionDataSg)
+        }
+    }
+}
+
+impl BinderMultiplexedReplyReceived {
+    pub(crate) fn tr_data(&mut self) -> &mut BinderTransactionData {
+        // SAFETY: Transparent wrapper is safe to transmute.
+        unsafe {
+            &mut *(&mut self.transaction_data as *mut uapi::binder_transaction_data
+                as *mut BinderTransactionData)
+        }
+    }
+}
+
+impl BinderMultiplexedReplyError {
+    pub(crate) fn new(request_id: u64, claim_id: u64, reason: u32, error: i32) -> Self {
+        Self(MaybeUninit::new(uapi::binder_multiplexed_reply_error {
+            request_id,
+            claim_id,
+            reason,
+            error,
+        }))
     }
 }
 
