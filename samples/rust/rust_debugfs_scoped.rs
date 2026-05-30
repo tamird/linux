@@ -8,6 +8,7 @@
 
 use kernel::{
     debugfs::{
+        self,
         Dir,
         Scope, //
     },
@@ -82,13 +83,16 @@ fn create_file_write(
             DeviceData { name, nums, blob },
             &file_name,
             |dev_data, dir| {
-                for (idx, val) in dev_data.nums.iter().enumerate() {
+                for (idx, _) in dev_data.nums.iter().enumerate() {
                     let Ok(name) = CString::try_from_fmt(fmt!("{idx}")) else {
                         return;
                     };
-                    dir.read_write_file(&name, val);
+                    dir.read_write_file(
+                        &name,
+                        dev_data.project_static(move |data| &data.nums[idx]),
+                    );
                 }
-                dir.read_write_binary_file(c"blob", &dev_data.blob);
+                dir.read_write_binary_file(c"blob", debugfs::project!(dev_data, .blob));
             },
         ),
         GFP_KERNEL,

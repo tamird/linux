@@ -107,9 +107,7 @@ impl Dir {
         let scope = Scope::<T>::new(data, move |data| {
             #[cfg(CONFIG_DEBUG_FS)]
             if let Some(parent) = &self.0 {
-                // SAFETY: Because data derives from a scope, and our entry will be dropped before
-                // the data is dropped, it is guaranteed to outlive the entry we return.
-                unsafe { Entry::dynamic_file(name, parent.clone(), data, file_ops) }
+                Entry::dynamic_file(name, parent.clone(), data.data, file_ops)
             } else {
                 Entry::empty()
             }
@@ -390,7 +388,7 @@ impl Dir {
         init: F,
     ) -> impl PinInit<Scope<T>, E> + 'a
     where
-        F: for<'data, 'dir> FnOnce(&'data T, &'dir ScopedDir<'data, 'dir>) + 'a,
+        F: for<'data, 'dir> FnOnce(ScopedRef<'data, T>, &'dir ScopedDir<'data, 'dir>) + 'a,
     {
         Scope::new(data, |data| {
             let scoped = self.scoped_dir(name);
@@ -410,6 +408,8 @@ impl Dir {
 ///
 /// When dropped, a `Scope` will remove all directories and files in the filesystem backed by the
 /// attached data structure prior to releasing the attached data.
+/// The full debugfs proxy holds an active-user reference while operations access the attached
+/// data, so removing the entry waits for them to complete before releasing it.
 pub struct Scope<T> {
     // This order is load-bearing for drops - `_entry` must be dropped before `data`.
     #[cfg(CONFIG_DEBUG_FS)]
@@ -434,7 +434,7 @@ pub struct File<T> {
 impl<'b, T: 'b> Scope<T> {
     fn new<E: 'b, F>(data: impl PinInit<T, E> + 'b, init: F) -> impl PinInit<Self, E> + 'b
     where
-        F: for<'a> FnOnce(&'a T) + 'b,
+        F: for<'a> FnOnce(ScopedRef<'a, T>) + 'b,
     {
         try_pin_init! {
             Self {
@@ -443,7 +443,7 @@ impl<'b, T: 'b> Scope<T> {
             } ? E
         }
         .pin_chain(|scope| {
-            init(&scope.data);
+            init(ScopedRef::new(&scope.data));
             Ok(())
         })
     }
@@ -458,7 +458,7 @@ impl<'b, T: 'b> Scope<T> {
 
     fn new<E: 'b, F>(data: impl PinInit<T, E> + 'b, init: F) -> impl PinInit<Self, E> + 'b
     where
-        F: for<'a> FnOnce(&'a T) -> Entry<'static> + 'b,
+        F: for<'a> FnOnce(ScopedRef<'a, T>) -> Entry<'a> + 'b,
     {
         try_pin_init! {
             Self {
@@ -468,7 +468,15 @@ impl<'b, T: 'b> Scope<T> {
             } ? E
         }
         .pin_chain(|scope| {
-            *scope.entry_mut() = init(&scope.data);
+            let entry = init(ScopedRef::new(&scope.data));
+            // SAFETY: `init` may create an entry or entry tree pointing into
+            // `data`. `scope` is pinned, so `data` cannot move. The field
+            // order ensures that `_entry` removes that tree before `data` is
+            // dropped. The full debugfs proxy holds an active-user reference
+            // while invoking operations that access pointers into `data`, so
+            // removal waits for them; `release` does not access those pointers.
+            let entry = unsafe { core::mem::transmute::<Entry<'_>, Entry<'static>>(entry) };
+            *scope.entry_mut() = entry;
             Ok(())
         })
     }
@@ -489,7 +497,7 @@ impl<'a, T: 'a> Scope<T> {
         init: F,
     ) -> impl PinInit<Self, E> + 'a
     where
-        F: for<'data, 'dir> FnOnce(&'data T, &'dir ScopedDir<'data, 'dir>) + 'a,
+        F: for<'data, 'dir> FnOnce(ScopedRef<'data, T>, &'dir ScopedDir<'data, 'dir>) + 'a,
     {
         Scope::new(data, |data| {
             let scoped = ScopedDir::new(name);
@@ -512,6 +520,87 @@ impl<T> Deref for File<T> {
         &self.scope
     }
 }
+
+/// A witness for a value whose address remains valid while a [`Scope`] may use it.
+///
+/// A scope can outlive forgotten owning handles, so scoped file registration
+/// accepts this type instead of arbitrary references. Use [`project!`] for
+/// structural projections into scope-owned storage.
+pub struct ScopedRef<'data, T: ?Sized> {
+    data: &'data T,
+}
+
+impl<'data, T: ?Sized> ScopedRef<'data, T> {
+    fn new(data: &'data T) -> Self {
+        Self { data }
+    }
+
+    /// Projects through owned or static storage reachable from a `'static` value.
+    ///
+    /// The source value and any captured state contain no non-static
+    /// borrows, so a returned borrow remains live if the scope is forgotten.
+    #[inline]
+    pub fn project_static<U: ?Sized, F>(self, project: F) -> ScopedRef<'data, U>
+    where
+        T: 'static,
+        F: for<'a> FnOnce(&'a T) -> &'a U + 'static,
+    {
+        ScopedRef::new(project(self.data))
+    }
+
+    #[doc(hidden)]
+    #[inline]
+    pub fn __as_ptr(self) -> *const T {
+        core::ptr::from_ref(self.data)
+    }
+
+    /// # Safety
+    ///
+    /// `ptr` must point within the storage of the value represented by
+    /// `self`.
+    #[doc(hidden)]
+    #[inline]
+    pub unsafe fn __from_projected_ptr<U: ?Sized>(self, ptr: *const U) -> ScopedRef<'data, U> {
+        // SAFETY: By caller precondition, `ptr` points within `self.data`.
+        ScopedRef::new(unsafe { &*ptr })
+    }
+}
+
+impl<T: ?Sized> Clone for ScopedRef<'_, T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<T: ?Sized> Copy for ScopedRef<'_, T> {}
+
+impl<T: ?Sized> Deref for ScopedRef<'_, T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        self.data
+    }
+}
+
+/// Projects a [`ScopedRef`] into inline scope-owned storage.
+///
+/// Projection syntax is the same as [`crate::ptr::project!`]. In particular,
+/// it does not project through types implementing [`Deref`] or [`Index`],
+/// since those may reach storage outside the scoped value.
+///
+/// [`Index`]: core::ops::Index
+#[macro_export]
+macro_rules! debugfs_project {
+    ($data:expr, $($proj:tt)*) => {{
+        let data = $data;
+        let ptr = $crate::ptr::project!(data.__as_ptr(), $($proj)*);
+        // SAFETY: `ptr::project!` returns a pointer within the storage
+        // represented by `data`.
+        unsafe { data.__from_projected_ptr(ptr) }
+    }};
+}
+
+pub use crate::debugfs_project as project;
 
 /// A handle to a directory which will live at most `'dir`, accessing data that will live for at
 /// least `'data`.
@@ -538,9 +627,14 @@ impl<'data, 'dir> ScopedDir<'data, 'dir> {
         }
     }
 
-    fn create_file<T: Sync>(&self, name: &CStr, data: &'data T, vtable: &'static FileOps<T>) {
+    fn create_file<T: Sync>(
+        &self,
+        name: &CStr,
+        data: ScopedRef<'data, T>,
+        vtable: &'static FileOps<T>,
+    ) {
         #[cfg(CONFIG_DEBUG_FS)]
-        core::mem::forget(Entry::file(name, &self.entry, data, vtable));
+        core::mem::forget(Entry::file(name, &self.entry, data.data, vtable));
     }
 
     /// Creates a read-only file in this directory.
@@ -550,7 +644,11 @@ impl<'data, 'dir> ScopedDir<'data, 'dir> {
     /// This function does not produce an owning handle to the file. The created
     /// file is removed when the [`Scope`] that this directory belongs
     /// to is dropped.
-    pub fn read_only_file<T: Writer + Send + Sync + 'static>(&self, name: &CStr, data: &'data T) {
+    pub fn read_only_file<T: Writer + Send + Sync + 'static>(
+        &self,
+        name: &CStr,
+        data: ScopedRef<'data, T>,
+    ) {
         self.create_file(name, data, &T::FILE_OPS)
     }
 
@@ -563,7 +661,7 @@ impl<'data, 'dir> ScopedDir<'data, 'dir> {
     pub fn read_binary_file<T: BinaryWriter + Send + Sync + 'static>(
         &self,
         name: &CStr,
-        data: &'data T,
+        data: ScopedRef<'data, T>,
     ) {
         self.create_file(name, data, &T::FILE_OPS)
     }
@@ -579,7 +677,7 @@ impl<'data, 'dir> ScopedDir<'data, 'dir> {
     /// This function does not produce an owning handle to the file. The created
     /// file is removed when the [`Scope`] that this directory belongs
     /// to is dropped.
-    pub fn read_callback_file<T, F>(&self, name: &CStr, data: &'data T, _f: &'static F)
+    pub fn read_callback_file<T, F>(&self, name: &CStr, data: ScopedRef<'data, T>, _f: &'static F)
     where
         T: Send + Sync + 'static,
         F: Fn(&T, &mut fmt::Formatter<'_>) -> fmt::Result + Send + Sync,
@@ -599,7 +697,7 @@ impl<'data, 'dir> ScopedDir<'data, 'dir> {
     pub fn read_write_file<T: Writer + Reader + Send + Sync + 'static>(
         &self,
         name: &CStr,
-        data: &'data T,
+        data: ScopedRef<'data, T>,
     ) {
         let vtable = &<T as ReadWriteFile<_>>::FILE_OPS;
         self.create_file(name, data, vtable)
@@ -615,7 +713,7 @@ impl<'data, 'dir> ScopedDir<'data, 'dir> {
     pub fn read_write_binary_file<T: BinaryWriter + BinaryReader + Send + Sync + 'static>(
         &self,
         name: &CStr,
-        data: &'data T,
+        data: ScopedRef<'data, T>,
     ) {
         let vtable = &<T as BinaryReadWriteFile<_>>::FILE_OPS;
         self.create_file(name, data, vtable)
@@ -634,7 +732,7 @@ impl<'data, 'dir> ScopedDir<'data, 'dir> {
     pub fn read_write_callback_file<T, F, W>(
         &self,
         name: &CStr,
-        data: &'data T,
+        data: ScopedRef<'data, T>,
         _f: &'static F,
         _w: &'static W,
     ) where
@@ -655,7 +753,11 @@ impl<'data, 'dir> ScopedDir<'data, 'dir> {
     /// This function does not produce an owning handle to the file. The created
     /// file is removed when the [`Scope`] that this directory belongs
     /// to is dropped.
-    pub fn write_only_file<T: Reader + Send + Sync + 'static>(&self, name: &CStr, data: &'data T) {
+    pub fn write_only_file<T: Reader + Send + Sync + 'static>(
+        &self,
+        name: &CStr,
+        data: ScopedRef<'data, T>,
+    ) {
         let vtable = &<T as WriteFile<_>>::FILE_OPS;
         self.create_file(name, data, vtable)
     }
@@ -669,7 +771,7 @@ impl<'data, 'dir> ScopedDir<'data, 'dir> {
     pub fn write_binary_file<T: BinaryReader + Send + Sync + 'static>(
         &self,
         name: &CStr,
-        data: &'data T,
+        data: ScopedRef<'data, T>,
     ) {
         self.create_file(name, data, &T::FILE_OPS)
     }
@@ -684,8 +786,12 @@ impl<'data, 'dir> ScopedDir<'data, 'dir> {
     /// This function does not produce an owning handle to the file. The created
     /// file is removed when the [`Scope`] that this directory belongs
     /// to is dropped.
-    pub fn write_only_callback_file<T, W>(&self, name: &CStr, data: &'data T, _w: &'static W)
-    where
+    pub fn write_only_callback_file<T, W>(
+        &self,
+        name: &CStr,
+        data: ScopedRef<'data, T>,
+        _w: &'static W,
+    ) where
         T: Send + Sync + 'static,
         W: Fn(&T, &mut UserSliceReader) -> Result + Send + Sync,
     {

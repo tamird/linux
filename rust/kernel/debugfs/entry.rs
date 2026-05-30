@@ -51,20 +51,20 @@ impl Entry<'static> {
             _phantom: PhantomData,
         }
     }
+}
 
-    /// # Safety
-    ///
-    /// * `data` must outlive the returned `Entry`.
-    pub(crate) unsafe fn dynamic_file<T>(
+impl<'a> Entry<'a> {
+    pub(crate) fn dynamic_file<T>(
         name: &CStr,
-        parent: Arc<Self>,
-        data: &T,
+        parent: Arc<Entry<'static>>,
+        data: &'a T,
         file_ops: &'static FileOps<T>,
     ) -> Self {
         // SAFETY: The invariants of this function's arguments ensure the safety of this call.
         // * `name` is a valid C string by the invariants of `&CStr`.
         // * `parent.as_ptr()` is a pointer to a valid `dentry` by invariant.
-        // * The caller guarantees that `data` will outlive the returned `Entry`.
+        // * `data` is a valid pointer to `T` for lifetime `'a`.
+        // * The returned `Entry` has lifetime `'a`, so it cannot outlive `data`.
         // * The guarantees on `FileOps` assert the vtable will be compatible with the data we have
         //   provided.
         let entry = unsafe {
@@ -84,9 +84,7 @@ impl Entry<'static> {
             _phantom: PhantomData,
         }
     }
-}
 
-impl<'a> Entry<'a> {
     pub(crate) fn dir(name: &CStr, parent: Option<&'a Entry<'_>>) -> Self {
         let parent_ptr = match &parent {
             Some(entry) => entry.as_ptr(),

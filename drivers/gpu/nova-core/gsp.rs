@@ -175,9 +175,9 @@ impl Gsp {
                         .expect("DEBUGFS_ROOT not initialized");
 
                     log_parent.scope(log_buffers, dev.name(), |logs, dir| {
-                        dir.read_binary_file(c"loginit", &logs.loginit.0);
-                        dir.read_binary_file(c"logintr", &logs.logintr.0);
-                        dir.read_binary_file(c"logrm", &logs.logrm.0);
+                        dir.read_binary_file(c"loginit", debugfs::project!(logs, .loginit.0));
+                        dir.read_binary_file(c"logintr", debugfs::project!(logs, .logintr.0));
+                        dir.read_binary_file(c"logrm", debugfs::project!(logs, .logrm.0));
                     })
                 },
             }))
