@@ -36,15 +36,34 @@ pub use traits::{
     Writer, //
 };
 
-mod callback_adapters;
-use callback_adapters::{
-    FormatAdapter,
-    NoWriter,
-    WritableAdapter, //
-};
+/// Callback retained by a read-only callback file.
+pub type ReadCallback<T> = fn(&T, &mut fmt::Formatter<'_>) -> fmt::Result;
+
+/// Callback retained by a write-only callback file.
+pub type WriteCallback<T> = fn(&T, &mut UserSliceReader) -> Result;
+
+/// Callbacks retained by a read-write callback file.
+pub struct ReadWriteCallbacks<T> {
+    read: fn(&T, &mut fmt::Formatter<'_>) -> fmt::Result,
+    write: fn(&T, &mut UserSliceReader) -> Result,
+}
+
+impl<T> ReadWriteCallbacks<T> {
+    /// Creates callback state for a read-write callback file.
+    #[inline]
+    pub const fn new(
+        read: fn(&T, &mut fmt::Formatter<'_>) -> fmt::Result,
+        write: fn(&T, &mut UserSliceReader) -> Result,
+    ) -> Self {
+        Self { read, write }
+    }
+}
 
 mod file_ops;
 use file_ops::{
+    read_callback_ops,
+    read_write_callback_ops,
+    write_callback_ops,
     BinaryReadFile,
     BinaryReadWriteFile,
     BinaryWriteFile,
@@ -95,11 +114,12 @@ impl Dir {
 
     /// Creates a DebugFS file which will own the data produced by the initializer provided in
     /// `data`.
-    fn create_file<'a, T, E: 'a>(
+    fn create_file<'a, T, A, E: 'a>(
         &'a self,
         name: &'a CStr,
         data: impl PinInit<T, E> + 'a,
-        file_ops: &'static FileOps<T>,
+        aux: &'static A,
+        file_ops: &'static FileOps<T, A>,
     ) -> impl PinInit<File<T>, E> + 'a
     where
         T: Sync + 'static,
@@ -107,7 +127,7 @@ impl Dir {
         let scope = Scope::<T>::new(data, move |data| {
             #[cfg(CONFIG_DEBUG_FS)]
             if let Some(parent) = &self.0 {
-                Entry::dynamic_file(name, parent.clone(), data.data, file_ops)
+                Entry::dynamic_file(name, parent.clone(), data.data, aux, file_ops)
             } else {
                 Entry::empty()
             }
@@ -169,7 +189,7 @@ impl Dir {
         T: Writer + Send + Sync + 'static,
     {
         let file_ops = &<T as ReadFile<_>>::FILE_OPS;
-        self.create_file(name, data, file_ops)
+        self.create_file(name, data, &(), file_ops)
     }
 
     /// Creates a read-only binary file in this directory.
@@ -194,19 +214,21 @@ impl Dir {
     where
         T: BinaryWriter + Send + Sync + 'static,
     {
-        self.create_file(name, data, &T::FILE_OPS)
+        self.create_file(name, data, &(), &T::FILE_OPS)
     }
 
     /// Creates a read-only file in this directory, with contents from a callback.
     ///
-    /// `f` must be a function item or a non-capturing closure.
-    /// This is statically asserted and not a safety requirement.
+    /// `callback` is retained for the lifetime of the file and must have static storage.
     ///
     /// # Examples
     ///
     /// ```
     /// # use kernel::{
-    /// #     debugfs::Dir,
+    /// #     debugfs::{
+    /// #         Dir,
+    /// #         ReadCallback,
+    /// #     },
     /// #     prelude::*,
     /// #     sync::atomic::{
     /// #         Atomic,
@@ -214,31 +236,31 @@ impl Dir {
     /// #     },
     /// # };
     /// # let dir = Dir::new(c"foo");
+    /// static READ: ReadCallback<Atomic<u32>> = |val, f| {
+    ///     let out = val.load(Relaxed);
+    ///     writeln!(f, "{out:#010x}")
+    /// };
     /// let file = KBox::pin_init(
     ///     dir.read_callback_file(c"bar",
     ///     Atomic::<u32>::new(3),
-    ///     &|val, f| {
-    ///       let out = val.load(Relaxed);
-    ///       writeln!(f, "{out:#010x}")
-    ///     }),
+    ///     &READ),
     ///     GFP_KERNEL)?;
     /// // Reading "foo/bar" will show "0x00000003".
     /// file.store(10, Relaxed);
     /// // Reading "foo/bar" will now show "0x0000000a".
     /// # Ok::<(), Error>(())
     /// ```
-    pub fn read_callback_file<'a, T, E: 'a, F>(
+    pub fn read_callback_file<'a, T, E: 'a>(
         &'a self,
         name: &'a CStr,
         data: impl PinInit<T, E> + 'a,
-        _f: &'static F,
+        callback: &'static ReadCallback<T>,
     ) -> impl PinInit<File<T>, E> + 'a
     where
         T: Send + Sync + 'static,
-        F: Fn(&T, &mut fmt::Formatter<'_>) -> fmt::Result + Send + Sync,
     {
-        let file_ops = <FormatAdapter<T, F>>::FILE_OPS.adapt();
-        self.create_file(name, data, file_ops)
+        let file_ops = read_callback_ops::<T>();
+        self.create_file(name, data, callback, file_ops)
     }
 
     /// Creates a read-write file in this directory.
@@ -254,7 +276,7 @@ impl Dir {
         T: Writer + Reader + Send + Sync + 'static,
     {
         let file_ops = &<T as ReadWriteFile<_>>::FILE_OPS;
-        self.create_file(name, data, file_ops)
+        self.create_file(name, data, &(), file_ops)
     }
 
     /// Creates a read-write binary file in this directory.
@@ -270,32 +292,42 @@ impl Dir {
         T: BinaryWriter + BinaryReader + Send + Sync + 'static,
     {
         let file_ops = &<T as BinaryReadWriteFile<_>>::FILE_OPS;
-        self.create_file(name, data, file_ops)
+        self.create_file(name, data, &(), file_ops)
     }
 
     /// Creates a read-write file in this directory, with logic from callbacks.
     ///
-    /// Reading from the file is handled by `f`. Writing to the file is handled by `w`.
+    /// Reading from and writing to the file are handled by `callbacks`.
+    /// `callbacks` is retained for the lifetime of the file and must have static storage.
     ///
-    /// `f` and `w` must be function items or non-capturing closures.
-    /// This is statically asserted and not a safety requirement.
-    pub fn read_write_callback_file<'a, T, E: 'a, F, W>(
+    /// # Examples
+    ///
+    /// ```
+    /// # use kernel::{
+    /// #     debugfs::{Dir, ReadWriteCallbacks},
+    /// #     prelude::*,
+    /// # };
+    /// # let dir = Dir::new(c"foo");
+    /// static CALLBACKS: ReadWriteCallbacks<u32> = ReadWriteCallbacks::new(
+    ///     |value, f| writeln!(f, "{value}"),
+    ///     |_, _| Ok(()),
+    /// );
+    /// let _file = KBox::pin_init(
+    ///     dir.read_write_callback_file(c"bar", 3, &CALLBACKS),
+    ///     GFP_KERNEL)?;
+    /// # Ok::<(), Error>(())
+    /// ```
+    pub fn read_write_callback_file<'a, T, E: 'a>(
         &'a self,
         name: &'a CStr,
         data: impl PinInit<T, E> + 'a,
-        _f: &'static F,
-        _w: &'static W,
+        callbacks: &'static ReadWriteCallbacks<T>,
     ) -> impl PinInit<File<T>, E> + 'a
     where
         T: Send + Sync + 'static,
-        F: Fn(&T, &mut fmt::Formatter<'_>) -> fmt::Result + Send + Sync,
-        W: Fn(&T, &mut UserSliceReader) -> Result + Send + Sync,
     {
-        let file_ops =
-            <WritableAdapter<FormatAdapter<T, F>, W> as file_ops::ReadWriteFile<_>>::FILE_OPS
-                .adapt()
-                .adapt();
-        self.create_file(name, data, file_ops)
+        let file_ops = read_write_callback_ops::<T>();
+        self.create_file(name, data, callbacks, file_ops)
     }
 
     /// Creates a write-only file in this directory.
@@ -312,7 +344,7 @@ impl Dir {
     where
         T: Reader + Send + Sync + 'static,
     {
-        self.create_file(name, data, &T::FILE_OPS)
+        self.create_file(name, data, &(), &T::FILE_OPS)
     }
 
     /// Creates a write-only binary file in this directory.
@@ -329,27 +361,23 @@ impl Dir {
     where
         T: BinaryReader + Send + Sync + 'static,
     {
-        self.create_file(name, data, &T::FILE_OPS)
+        self.create_file(name, data, &(), &T::FILE_OPS)
     }
 
     /// Creates a write-only file in this directory, with write logic from a callback.
     ///
-    /// `w` must be a function item or a non-capturing closure.
-    /// This is statically asserted and not a safety requirement.
-    pub fn write_callback_file<'a, T, E: 'a, W>(
+    /// `callback` is retained for the lifetime of the file and must have static storage.
+    pub fn write_callback_file<'a, T, E: 'a>(
         &'a self,
         name: &'a CStr,
         data: impl PinInit<T, E> + 'a,
-        _w: &'static W,
+        callback: &'static WriteCallback<T>,
     ) -> impl PinInit<File<T>, E> + 'a
     where
         T: Send + Sync + 'static,
-        W: Fn(&T, &mut UserSliceReader) -> Result + Send + Sync,
     {
-        let file_ops = <WritableAdapter<NoWriter<T>, W> as WriteFile<_>>::FILE_OPS
-            .adapt()
-            .adapt();
-        self.create_file(name, data, file_ops)
+        let file_ops = write_callback_ops::<T>();
+        self.create_file(name, data, callback, file_ops)
     }
 
     // While this function is safe, it is intentionally not public because it's a bit of a
@@ -535,6 +563,12 @@ impl<'data, T: ?Sized> ScopedRef<'data, T> {
         Self { data }
     }
 
+    /// Creates a witness for data with static storage.
+    #[inline]
+    pub fn from_static(data: &'static T) -> Self {
+        Self { data }
+    }
+
     /// Projects through owned or static storage reachable from a `'static` value.
     ///
     /// The source value and any captured state contain no non-static
@@ -627,14 +661,15 @@ impl<'data, 'dir> ScopedDir<'data, 'dir> {
         }
     }
 
-    fn create_file<T: Sync>(
+    fn create_file<T: Sync, A>(
         &self,
         name: &CStr,
         data: ScopedRef<'data, T>,
-        vtable: &'static FileOps<T>,
+        aux: ScopedRef<'data, A>,
+        vtable: &'static FileOps<T, A>,
     ) {
         #[cfg(CONFIG_DEBUG_FS)]
-        core::mem::forget(Entry::file(name, &self.entry, data.data, vtable));
+        core::mem::forget(Entry::file(name, &self.entry, data.data, aux.data, vtable));
     }
 
     /// Creates a read-only file in this directory.
@@ -649,7 +684,7 @@ impl<'data, 'dir> ScopedDir<'data, 'dir> {
         name: &CStr,
         data: ScopedRef<'data, T>,
     ) {
-        self.create_file(name, data, &T::FILE_OPS)
+        self.create_file(name, data, ScopedRef::new(&()), &T::FILE_OPS)
     }
 
     /// Creates a read-only binary file in this directory.
@@ -663,27 +698,28 @@ impl<'data, 'dir> ScopedDir<'data, 'dir> {
         name: &CStr,
         data: ScopedRef<'data, T>,
     ) {
-        self.create_file(name, data, &T::FILE_OPS)
+        self.create_file(name, data, ScopedRef::new(&()), &T::FILE_OPS)
     }
 
     /// Creates a read-only file in this directory, with contents from a callback.
     ///
-    /// The file contents are generated by calling `f` with `data`.
-    ///
-    ///
-    /// `f` must be a function item or a non-capturing closure.
-    /// This is statically asserted and not a safety requirement.
+    /// The file contents are generated by calling `callback` with `data`.
+    /// `callback` is retained until the surrounding [`Scope`] removes the file,
+    /// so it may be stored in `data`.
     ///
     /// This function does not produce an owning handle to the file. The created
     /// file is removed when the [`Scope`] that this directory belongs
     /// to is dropped.
-    pub fn read_callback_file<T, F>(&self, name: &CStr, data: ScopedRef<'data, T>, _f: &'static F)
-    where
+    pub fn read_callback_file<T>(
+        &self,
+        name: &CStr,
+        data: ScopedRef<'data, T>,
+        callback: ScopedRef<'data, ReadCallback<T>>,
+    ) where
         T: Send + Sync + 'static,
-        F: Fn(&T, &mut fmt::Formatter<'_>) -> fmt::Result + Send + Sync,
     {
-        let vtable = <FormatAdapter<T, F> as ReadFile<_>>::FILE_OPS.adapt();
-        self.create_file(name, data, vtable)
+        let vtable = read_callback_ops::<T>();
+        self.create_file(name, data, callback, vtable)
     }
 
     /// Creates a read-write file in this directory.
@@ -700,7 +736,7 @@ impl<'data, 'dir> ScopedDir<'data, 'dir> {
         data: ScopedRef<'data, T>,
     ) {
         let vtable = &<T as ReadWriteFile<_>>::FILE_OPS;
-        self.create_file(name, data, vtable)
+        self.create_file(name, data, ScopedRef::new(&()), vtable)
     }
 
     /// Creates a read-write binary file in this directory.
@@ -716,34 +752,28 @@ impl<'data, 'dir> ScopedDir<'data, 'dir> {
         data: ScopedRef<'data, T>,
     ) {
         let vtable = &<T as BinaryReadWriteFile<_>>::FILE_OPS;
-        self.create_file(name, data, vtable)
+        self.create_file(name, data, ScopedRef::new(&()), vtable)
     }
 
     /// Creates a read-write file in this directory, with logic from callbacks.
     ///
-    /// Reading from the file is handled by `f`. Writing to the file is handled by `w`.
-    ///
-    /// `f` and `w` must be function items or non-capturing closures.
-    /// This is statically asserted and not a safety requirement.
+    /// Reading from and writing to the file are handled by `callbacks`.
+    /// `callbacks` is retained until the surrounding [`Scope`] removes the file,
+    /// so it may be stored in `data`.
     ///
     /// This function does not produce an owning handle to the file. The created
     /// file is removed when the [`Scope`] that this directory belongs
     /// to is dropped.
-    pub fn read_write_callback_file<T, F, W>(
+    pub fn read_write_callback_file<T>(
         &self,
         name: &CStr,
         data: ScopedRef<'data, T>,
-        _f: &'static F,
-        _w: &'static W,
+        callbacks: ScopedRef<'data, ReadWriteCallbacks<T>>,
     ) where
         T: Send + Sync + 'static,
-        F: Fn(&T, &mut fmt::Formatter<'_>) -> fmt::Result + Send + Sync,
-        W: Fn(&T, &mut UserSliceReader) -> Result + Send + Sync,
     {
-        let vtable = <WritableAdapter<FormatAdapter<T, F>, W> as ReadWriteFile<_>>::FILE_OPS
-            .adapt()
-            .adapt();
-        self.create_file(name, data, vtable)
+        let vtable = read_write_callback_ops::<T>();
+        self.create_file(name, data, callbacks, vtable)
     }
 
     /// Creates a write-only file in this directory.
@@ -759,7 +789,7 @@ impl<'data, 'dir> ScopedDir<'data, 'dir> {
         data: ScopedRef<'data, T>,
     ) {
         let vtable = &<T as WriteFile<_>>::FILE_OPS;
-        self.create_file(name, data, vtable)
+        self.create_file(name, data, ScopedRef::new(&()), vtable)
     }
 
     /// Creates a write-only binary file in this directory.
@@ -773,32 +803,28 @@ impl<'data, 'dir> ScopedDir<'data, 'dir> {
         name: &CStr,
         data: ScopedRef<'data, T>,
     ) {
-        self.create_file(name, data, &T::FILE_OPS)
+        self.create_file(name, data, ScopedRef::new(&()), &T::FILE_OPS)
     }
 
     /// Creates a write-only file in this directory, with write logic from a callback.
     ///
-    /// Writing to the file is handled by `w`.
-    ///
-    /// `w` must be a function item or a non-capturing closure.
-    /// This is statically asserted and not a safety requirement.
+    /// Writing to the file is handled by `callback`.
+    /// `callback` is retained until the surrounding [`Scope`] removes the file,
+    /// so it may be stored in `data`.
     ///
     /// This function does not produce an owning handle to the file. The created
     /// file is removed when the [`Scope`] that this directory belongs
     /// to is dropped.
-    pub fn write_only_callback_file<T, W>(
+    pub fn write_only_callback_file<T>(
         &self,
         name: &CStr,
         data: ScopedRef<'data, T>,
-        _w: &'static W,
+        callback: ScopedRef<'data, WriteCallback<T>>,
     ) where
         T: Send + Sync + 'static,
-        W: Fn(&T, &mut UserSliceReader) -> Result + Send + Sync,
     {
-        let vtable = &<WritableAdapter<NoWriter<T>, W> as WriteFile<_>>::FILE_OPS
-            .adapt()
-            .adapt();
-        self.create_file(name, data, vtable)
+        let vtable = write_callback_ops::<T>();
+        self.create_file(name, data, callback, vtable)
     }
 
     fn empty() -> Self {

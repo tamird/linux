@@ -10,7 +10,8 @@ use kernel::{
     debugfs::{
         self,
         Dir,
-        Scope, //
+        Scope,
+        WriteCallback, //
     },
     new_mutex,
     prelude::*,
@@ -106,6 +107,9 @@ struct RustScopedDebugFs {
     _data: Pin<KBox<Scope<ModuleData>>>,
 }
 
+static CREATE_FILE_WRITE: WriteCallback<ModuleData> = create_file_write;
+static REMOVE_FILE_WRITE: WriteCallback<ModuleData> = remove_file_write;
+
 #[pin_data]
 struct ModuleData {
     device_dir: Dir,
@@ -132,8 +136,16 @@ struct DeviceData {
 
 fn init_control(base_dir: &Dir, dyn_dirs: Dir) -> impl PinInit<Scope<ModuleData>> + '_ {
     base_dir.scope(ModuleData::init(dyn_dirs), c"control", |data, dir| {
-        dir.write_only_callback_file(c"create", data, &create_file_write);
-        dir.write_only_callback_file(c"remove", data, &remove_file_write);
+        dir.write_only_callback_file(
+            c"create",
+            data,
+            debugfs::ScopedRef::from_static(&CREATE_FILE_WRITE),
+        );
+        dir.write_only_callback_file(
+            c"remove",
+            data,
+            debugfs::ScopedRef::from_static(&REMOVE_FILE_WRITE),
+        );
     })
 }
 

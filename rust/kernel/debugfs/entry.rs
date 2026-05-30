@@ -54,26 +54,31 @@ impl Entry<'static> {
 }
 
 impl<'a> Entry<'a> {
-    pub(crate) fn dynamic_file<T>(
+    pub(crate) fn dynamic_file<T, A>(
         name: &CStr,
         parent: Arc<Entry<'static>>,
         data: &'a T,
-        file_ops: &'static FileOps<T>,
+        aux: &'static A,
+        file_ops: &'static FileOps<T, A>,
     ) -> Self {
         // SAFETY: The invariants of this function's arguments ensure the safety of this call.
         // * `name` is a valid C string by the invariants of `&CStr`.
         // * `parent.as_ptr()` is a pointer to a valid `dentry` by invariant.
-        // * `data` is a valid pointer to `T` for lifetime `'a`.
-        // * The returned `Entry` has lifetime `'a`, so it cannot outlive `data`.
-        // * The guarantees on `FileOps` assert the vtable will be compatible with the data we have
-        //   provided.
+        // * `data` is valid for lifetime `'a`, and the returned `Entry` cannot outlive it.
+        // * `aux` has static lifetime.
+        // * `file_ops` reads the private-data and auxiliary-data pointers only
+        //   as shared references to `T` and `A`, respectively, and does not
+        //   access either pointer after removal.
+        // * The full proxy installed by `debugfs_create_file_full()` holds an
+        //   active-user reference while invoking operations which access the
+        //   pointers, and removal waits for active users.
         let entry = unsafe {
             bindings::debugfs_create_file_full(
                 name.as_char_ptr(),
                 file_ops.mode(),
                 parent.as_ptr(),
                 core::ptr::from_ref(data) as *mut c_void,
-                core::ptr::null(),
+                core::ptr::from_ref(aux).cast(),
                 &**file_ops,
             )
         };
@@ -104,27 +109,32 @@ impl<'a> Entry<'a> {
         }
     }
 
-    pub(crate) fn file<T>(
+    pub(crate) fn file<T, A>(
         name: &CStr,
         parent: &'a Entry<'_>,
         data: &'a T,
-        file_ops: &FileOps<T>,
+        aux: &'a A,
+        file_ops: &'static FileOps<T, A>,
     ) -> Self {
         // SAFETY: The invariants of this function's arguments ensure the safety of this call.
         // * `name` is a valid C string by the invariants of `&CStr`.
         // * `parent.as_ptr()` is a pointer to a valid `dentry` because we have `&'a Entry`.
-        // * `data` is a valid pointer to `T` for lifetime `'a`.
-        // * The returned `Entry` has lifetime `'a`, so it cannot outlive `parent` or `data`.
-        // * The caller guarantees that `vtable` is compatible with `data`.
-        // * The guarantees on `FileOps` assert the vtable will be compatible with the data we have
-        //   provided.
+        // * `data` and `aux` are valid for lifetime `'a`.
+        // * The returned `Entry` has lifetime `'a`, so it cannot outlive `parent`, `data`, or
+        //   `aux`.
+        // * `file_ops` reads the private-data and auxiliary-data pointers only
+        //   as shared references to `T` and `A`, respectively, and does not
+        //   access either pointer after removal.
+        // * The full proxy installed by `debugfs_create_file_full()` holds an
+        //   active-user reference while invoking operations which access the
+        //   pointers, and removal waits for active users.
         let entry = unsafe {
             bindings::debugfs_create_file_full(
                 name.as_char_ptr(),
                 file_ops.mode(),
                 parent.as_ptr(),
                 core::ptr::from_ref(data) as *mut c_void,
-                core::ptr::null(),
+                core::ptr::from_ref(aux).cast(),
                 &**file_ops,
             )
         };
