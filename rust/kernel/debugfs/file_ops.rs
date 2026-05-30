@@ -96,8 +96,8 @@ unsafe extern "C" fn writer_open<T: Writer + Sync>(
     let data = unsafe { (*inode).i_private };
     // SAFETY:
     // * `file` is acceptable by caller precondition.
-    // * `print_act` will be called on a `seq_file` with private data set to the third argument,
-    //   so we meet its safety requirements.
+    // * `writer_act` will be called as a seq-file show callback with private data set to the
+    //   third argument, so we meet its safety requirements.
     // * The `data` pointer passed in the third argument is a valid `T` pointer that outlives
     //   this call by caller preconditions.
     unsafe { bindings::single_open(file, Some(writer_act::<T>), data) }
@@ -107,8 +107,10 @@ unsafe extern "C" fn writer_open<T: Writer + Sync>(
 ///
 /// # Safety
 ///
-/// `seq` must point to a live `seq_file` whose private data is a valid pointer to a `T` which may
-/// not have any unique references alias it during the call.
+/// `seq` must point to a live `seq_file`. No other thread may access any field
+/// except by reading `private` during the call. Its private data must be a
+/// valid pointer to a `T` which may not have any unique references alias it
+/// during the call.
 unsafe extern "C" fn writer_act<T: Writer + Sync>(
     seq: *mut bindings::seq_file,
     _: *mut c_void,
@@ -116,8 +118,8 @@ unsafe extern "C" fn writer_act<T: Writer + Sync>(
     // SAFETY: By caller precondition, this pointer is valid pointer to a `T`, and
     // there are not and will not be any unique references until we are done.
     let data = unsafe { &*((*seq).private.cast::<T>()) };
-    // SAFETY: By caller precondition, `seq_file` points to a live `seq_file`, so we can lift
-    // it.
+    // SAFETY: By caller precondition, concurrent accesses to `seq` only read
+    // `private`.
     let seq_file = unsafe { SeqFile::from_raw(seq) };
     seq_print!(seq_file, "{}", WriterAdapter(data));
     0
@@ -159,7 +161,8 @@ fn read<T: Reader + Sync>(data: &T, buf: *const c_char, count: usize) -> isize {
 ///
 /// `file` must be a valid pointer to a `file` struct.
 /// The `private_data` of the file must contain a valid pointer to a `seq_file` whose
-/// `private` data in turn points to a `T` that implements `Reader`.
+/// `private` data in turn is valid to convert to a shared reference to a `T` that
+/// implements `Reader` during the call.
 /// `buf` must be a valid user-space buffer.
 pub(crate) unsafe extern "C" fn write<T: Reader + Sync>(
     file: *mut bindings::file,
@@ -167,10 +170,17 @@ pub(crate) unsafe extern "C" fn write<T: Reader + Sync>(
     count: usize,
     _ppos: *mut bindings::loff_t,
 ) -> isize {
-    // SAFETY: The file was opened with `single_open`, which sets `private_data` to a `seq_file`.
-    let seq = unsafe { &mut *((*file).private_data.cast::<bindings::seq_file>()) };
-    // SAFETY: By caller precondition, this pointer is live and points to a value of type `T`.
-    let data = unsafe { &*(seq.private as *const T) };
+    // SAFETY: By caller precondition, `file` is a valid pointer to a `file`
+    // struct, so it is valid to obtain a raw pointer to this field.
+    let seq_addr = unsafe { &raw const (*file).private_data };
+    // SAFETY: By caller precondition, the `private_data` field points to a
+    // live `seq_file`.
+    let seq = unsafe { (*seq_addr).cast::<bindings::seq_file>() };
+    // SAFETY: By caller precondition, `seq` is live and its `private` field
+    // is valid to convert to a shared reference to `T`. `single_open`
+    // initializes `private` before file operations run and this file type only
+    // reads it, including while the read path may hold a `SeqFile`.
+    let data = unsafe { &*((*seq).private.cast::<T>()) };
     read(data, buf, count)
 }
 
@@ -194,9 +204,8 @@ impl<T: Writer + Reader + Sync> ReadWriteFile<T> for T {
         // `writer_open`'s only requirement beyond what is provided to all open functions is that
         // the inode's data pointer must point to a `T` that will outlive it, which matches the
         // `FileOps` requirements.
-        // `write` only requires that the file's private data pointer points to `seq_file`
-        // which points to a `T` that will outlive it, which matches what `writer_open`
-        // provides.
+        // `write` only reads the `seq_file` private pointer installed by
+        // `writer_open`, which points to a `T` that outlives it.
         unsafe { FileOps::new(operations, 0o600) }
     };
 }

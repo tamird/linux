@@ -20,10 +20,11 @@ impl SeqFile {
     ///
     /// The caller must ensure that for the duration of `'a` the following is satisfied:
     /// * The pointer points at a valid `struct seq_file`.
-    /// * The `struct seq_file` is not accessed from any other thread.
+    /// * No other thread accesses any field except by reading `private`.
     pub unsafe fn from_raw<'a>(ptr: *mut bindings::seq_file) -> &'a SeqFile {
-        // SAFETY: The caller ensures that the reference is valid for 'a. There's no way to trigger
-        // a data race by using the `&SeqFile` since this is the only thread accessing the seq_file.
+        // SAFETY: The caller ensures that the reference is valid for `'a` and that any
+        // concurrent access only reads `private`. The `Opaque` inner field permits that
+        // access without creating an aliasing reference to the wrapped C object.
         //
         // CAST: The layout of `struct seq_file` and `SeqFile` is compatible.
         unsafe { &*ptr.cast() }
