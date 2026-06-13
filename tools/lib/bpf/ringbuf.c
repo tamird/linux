@@ -257,8 +257,8 @@ struct ring_buffer_iter_state {
 	union {
 		struct {
 			struct ring *ring;
-			unsigned long cons_pos;
-			unsigned long prod_pos;
+			unsigned long consumer_pos;
+			unsigned long producer_pos;
 			bool consumer_dirty;
 			bool needs_wakeup;
 		};
@@ -279,7 +279,7 @@ static void ringbuf_iter_publish(struct ring_buffer_iter_state *state)
 		return;
 
 	/* Release consumed records to the producer. */
-	__atomic_store_n(state->ring->consumer_pos, state->cons_pos,
+	__atomic_store_n(state->ring->consumer_pos, state->consumer_pos,
 			 __ATOMIC_RELEASE);
 	state->consumer_dirty = false;
 	state->needs_wakeup = true;
@@ -291,8 +291,9 @@ static void ringbuf_iter_init(struct ring_buffer_iter *it, struct ring *r)
 
 	memset(it, 0, sizeof(*it));
 	state->ring = r;
-	state->cons_pos = __atomic_load_n(r->consumer_pos, __ATOMIC_ACQUIRE);
-	state->prod_pos = state->cons_pos;
+	state->consumer_pos =
+		__atomic_load_n(r->consumer_pos, __ATOMIC_ACQUIRE);
+	state->producer_pos = state->consumer_pos;
 }
 
 int ring_buffer_iter_new(struct ring_buffer_iter *it, struct ring *r)
@@ -311,9 +312,6 @@ static const void *ringbuf_iter_next(struct ring_buffer_iter *it, size_t *size)
 	struct ring *r;
 	struct ring_buffer_iter_state *state;
 	int *len_ptr, len;
-	unsigned long cons_pos, prod_pos;
-	bool got_new_data;
-	void *sample;
 
 	if (!it)
 		return NULL;
@@ -324,12 +322,9 @@ static const void *ringbuf_iter_next(struct ring_buffer_iter *it, size_t *size)
 
 	r = state->ring;
 	ringbuf_iter_publish(state);
-	cons_pos = state->cons_pos;
-	prod_pos = state->prod_pos;
 
-	do {
-		got_new_data = false;
-		if (cons_pos == prod_pos) {
+	for (;;) {
+		if (state->consumer_pos == state->producer_pos) {
 			ringbuf_iter_publish(state);
 			if (state->needs_wakeup) {
 				/* Ensure either this sees a new record or its producer sees
@@ -338,45 +333,43 @@ static const void *ringbuf_iter_next(struct ring_buffer_iter *it, size_t *size)
 				__atomic_thread_fence(__ATOMIC_SEQ_CST);
 				state->needs_wakeup = false;
 			}
-			prod_pos = __atomic_load_n(r->producer_pos,
-						   __ATOMIC_ACQUIRE);
-			state->prod_pos = prod_pos;
+			state->producer_pos = __atomic_load_n(r->producer_pos,
+							      __ATOMIC_ACQUIRE);
 		}
 
-		while (cons_pos != prod_pos) {
-			len_ptr = r->data + (cons_pos & r->mask);
-			len = __atomic_load_n(len_ptr, __ATOMIC_ACQUIRE);
+		if (state->consumer_pos == state->producer_pos) {
+			state->ring = NULL;
+			return NULL;
+		}
 
-			/* Retry a busy record once after publishing prior records. */
-			if (len & BPF_RINGBUF_BUSY_BIT) {
-				ringbuf_iter_publish(state);
-				got_new_data = state->needs_wakeup;
-				if (got_new_data) {
-					/* Order the consumer update before retrying the header. */
-					__atomic_thread_fence(__ATOMIC_SEQ_CST);
-					state->needs_wakeup = false;
-				}
-				break;
-			}
+		len_ptr = r->data + (state->consumer_pos & r->mask);
+		len = __atomic_load_n(len_ptr, __ATOMIC_ACQUIRE);
 
-			got_new_data = true;
-			cons_pos += roundup_len(len);
-			state->cons_pos = cons_pos;
-			state->consumer_dirty = true;
-
-			if ((len & BPF_RINGBUF_DISCARD_BIT) == 0) {
-				sample = (void *)len_ptr + BPF_RINGBUF_HDR_SZ;
-				if (size)
-					*size = len;
-				return sample;
-			}
-
+		/* Publish prior records and retry a record that is still busy. */
+		if (len & BPF_RINGBUF_BUSY_BIT) {
 			ringbuf_iter_publish(state);
+			if (!state->needs_wakeup) {
+				state->ring = NULL;
+				return NULL;
+			}
+			/* Order the consumer update before retrying the header. */
+			__atomic_thread_fence(__ATOMIC_SEQ_CST);
+			state->needs_wakeup = false;
+			continue;
 		}
-	} while (got_new_data);
 
-	state->ring = NULL;
-	return NULL;
+		state->consumer_pos += roundup_len(len);
+		state->consumer_dirty = true;
+
+		if (len & BPF_RINGBUF_DISCARD_BIT) {
+			ringbuf_iter_publish(state);
+			continue;
+		}
+
+		if (size)
+			*size = len;
+		return (void *)len_ptr + BPF_RINGBUF_HDR_SZ;
+	}
 }
 
 const void *ring_buffer_iter_next(struct ring_buffer_iter *it, size_t *size)
