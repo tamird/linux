@@ -574,6 +574,88 @@ static void ringbuf_null_cb_subtest(void)
 	}
 }
 
+#define N_WAKEUP_SAMPLES 20000
+
+struct wakeup_ctx {
+	bool stop;
+};
+
+static void *wakeup_producer(void *arg)
+{
+	struct wakeup_ctx *ctx = arg;
+
+	while (!__atomic_load_n(&ctx->stop, __ATOMIC_RELAXED))
+		syscall(__NR_getpgid);
+	return NULL;
+}
+
+static void ringbuf_wakeup_subtest(void)
+{
+	int err;
+	struct test_ringbuf_n_lskel *skel_n
+		__attribute__((cleanup(cleanup_test_ringbuf_n_lskel))) =
+			test_ringbuf_n_lskel__open();
+	if (!ASSERT_OK_PTR(skel_n, "test_ringbuf_n_lskel__open"))
+		return;
+
+	skel_n->maps.ringbuf.max_entries = getpagesize();
+	skel_n->bss->pid = getpid();
+	skel_n->bss->value = SAMPLE_VALUE;
+
+	err = test_ringbuf_n_lskel__load(skel_n);
+	if (!ASSERT_OK(err, "test_ringbuf_n_lskel__load"))
+		return;
+
+	err = test_ringbuf_n_lskel__attach(skel_n);
+	if (!ASSERT_OK(err, "test_ringbuf_n_lskel__attach"))
+		return;
+
+	struct ring_buffer *ringbuf
+		__attribute__((cleanup(cleanup_ring_buffer))) =
+			ring_buffer__new(skel_n->maps.ringbuf.map_fd,
+					 process_noop_sample, NULL, NULL);
+	if (!ASSERT_OK_PTR(ringbuf, "ring_buffer__new"))
+		return;
+
+	struct epoll_event event = {
+		.events = EPOLLIN | EPOLLET,
+	};
+	int epoll_fd __attribute__((cleanup(cleanup_fd))) =
+		epoll_create1(EPOLL_CLOEXEC);
+	if (!ASSERT_OK_FD(epoll_fd, "epoll_create1"))
+		return;
+
+	err = epoll_ctl(epoll_fd, EPOLL_CTL_ADD, skel_n->maps.ringbuf.map_fd,
+			&event);
+	if (!ASSERT_OK(err, "epoll_ctl"))
+		return;
+
+	pthread_t producer;
+	struct wakeup_ctx ctx = {};
+
+	err = pthread_create(&producer, NULL, wakeup_producer, &ctx);
+	if (!ASSERT_OK(err, "pthread_create"))
+		return;
+	struct thread_guard producer_guard
+		__attribute__((cleanup(cleanup_thread))) = {
+			.thread = producer,
+			.stop = &ctx.stop,
+			.joined = false,
+		};
+
+	int total = 0;
+
+	while (total < N_WAKEUP_SAMPLES) {
+		err = epoll_wait(epoll_fd, &event, 1, 1000);
+		if (!ASSERT_EQ(err, 1, "epoll_wait"))
+			return;
+		while ((err = ring_buffer__consume_n(ringbuf, 1)) > 0)
+			total += err;
+		if (!ASSERT_OK(err, "ring_buffer__consume_n"))
+			return;
+	}
+}
+
 static void ringbuf_n_subtest(void)
 {
 	struct test_ringbuf_n_lskel *skel_n
@@ -783,6 +865,8 @@ void test_ringbuf(void)
 		ringbuf_n_subtest();
 	if (test__start_subtest("ringbuf_null_cb"))
 		ringbuf_null_cb_subtest();
+	if (test__start_subtest("ringbuf_wakeup"))
+		ringbuf_wakeup_subtest();
 	if (test__start_subtest("ringbuf_map_key"))
 		ringbuf_map_key_subtest();
 	if (test__start_subtest("ringbuf_write"))
