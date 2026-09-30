@@ -643,8 +643,8 @@ static void test_bitmap_arr64(struct kunit *kunittest)
 		}
 
 		if (nbits < EXP1_IN_BITS - 64)
-			expect_eq_uint(arr[DIV_ROUND_UP(nbits, 64)],
-				       0xa5a5a5a5);
+			KUNIT_EXPECT_EQ(kunittest, arr[DIV_ROUND_UP(nbits, 64)],
+					0xa5a5a5a5a5a5a5a5ULL);
 	}
 }
 
